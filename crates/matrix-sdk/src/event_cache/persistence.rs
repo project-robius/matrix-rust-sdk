@@ -334,6 +334,10 @@ pub(super) async fn is_bundled_copy_worth_saving(
     };
     Ok(match store.find_event(room_id, event_id).await? {
         None => true,
+        // A redaction is final, even for a copy that couldn't be decrypted.
+        Some(stored) if stored.raw().deserialize().is_ok_and(|stored| stored.is_redacted()) => {
+            false
+        }
         Some(stored) => {
             matches!(stored.kind, TimelineEventKind::UnableToDecrypt { .. })
                 && !matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. })

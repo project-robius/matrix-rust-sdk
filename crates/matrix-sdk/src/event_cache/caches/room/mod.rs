@@ -776,6 +776,7 @@ mod timed_tests {
     use futures_util::FutureExt;
     use matrix_sdk_base::{
         RoomState,
+        deserialized_responses::{TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason},
         event_cache::{
             Gap,
             store::{EventCacheStore as _, MemoryStore},
@@ -1148,6 +1149,84 @@ mod timed_tests {
             .text_msg("thread root")
             .event_id(thread_root_id)
             .with_bundled_thread_summary(reply().into(), 1, false)
+            .into_event();
+        let timeline = Timeline { limited: false, prev_batch: None, events: vec![root] };
+        room_event_cache
+            .handle_joined_room_update(
+                timeline,
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let stored_reply = event_cache_store.find_event(room_id, reply_id).await.unwrap().unwrap();
+        assert!(stored_reply.raw().deserialize().unwrap().is_redacted());
+    }
+
+    #[async_test]
+    async fn test_bundled_copy_does_not_overwrite_a_redacted_utd() {
+        let room_id = room_id!("!galette:saucisse.bzh");
+        let thread_root_id = event_id!("$thread_root");
+        let reply_id = event_id!("$reply");
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+
+        // A thread reply got redacted while it still couldn't be decrypted.
+        let event_cache_store = Arc::new(MemoryStore::new());
+        let redacted_reply = Raw::from_json_string(
+            json!({
+                "type": "m.room.encrypted",
+                "event_id": reply_id,
+                "sender": "@ben:saucisse.bzh",
+                "origin_server_ts": 1,
+                "content": {},
+                "unsigned": {
+                    "redacted_because": {
+                        "type": "m.room.redaction",
+                        "event_id": "$redaction",
+                        "sender": "@ben:saucisse.bzh",
+                        "origin_server_ts": 2,
+                        "redacts": reply_id,
+                        "content": { "redacts": reply_id },
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let utd_info =
+            UnableToDecryptInfo { session_id: None, reason: UnableToDecryptReason::Unknown };
+        event_cache_store
+            .save_event(room_id, TimelineEvent::from_utd(redacted_reply, utd_info))
+            .await
+            .unwrap();
+
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new(CrossProcessLockConfig::multi_process("hodor"))
+                        .event_cache_store(event_cache_store.clone()),
+                )
+            })
+            .build()
+            .await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+        // Then its root shows up, bundling a readable copy of the reply.
+        let reply =
+            f.text_msg("secret").in_thread(thread_root_id, thread_root_id).event_id(reply_id);
+        let root = f
+            .text_msg("thread root")
+            .event_id(thread_root_id)
+            .with_bundled_thread_summary(reply.into(), 1, false)
             .into_event();
         let timeline = Timeline { limited: false, prev_batch: None, events: vec![root] };
         room_event_cache
