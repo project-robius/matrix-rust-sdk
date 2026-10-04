@@ -234,12 +234,20 @@ impl EventCacheStore for MemoryStore {
     }
 
     async fn clear_all_events(&self, room_id: Option<&RoomId>) -> Result<(), Self::Error> {
+        let mut inner = self.inner.write().unwrap();
+
         match room_id {
             Some(room_id) => {
-                self.inner.write().unwrap().events.clear_room(room_id);
+                inner.events.clear_room(room_id);
             }
             None => {
-                self.inner.write().unwrap().events.clear();
+                inner.events.clear();
+            }
+        }
+
+        for ((thread_room_id, _thread_id), thread_info) in &mut inner.threads {
+            if room_id.is_none_or(|room_id| room_id == thread_room_id) {
+                thread_info.forget_reply_count();
             }
         }
 

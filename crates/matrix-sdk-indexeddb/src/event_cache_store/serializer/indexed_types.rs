@@ -50,8 +50,8 @@ use crate::{
                 INDEXED_KEY_UPPER_STRING,
             },
             traits::{
-                Indexed, IndexedKey, IndexedKeyComponentBounds, IndexedPrefixKeyBounds,
-                IndexedPrefixKeyComponentBounds,
+                Indexed, IndexedKey, IndexedKeyBounds, IndexedKeyComponentBounds,
+                IndexedPrefixKeyBounds, IndexedPrefixKeyComponentBounds,
             },
         },
         safe_encode::types::{MaybeEncrypted, SafeEncodeSerializer},
@@ -745,6 +745,16 @@ impl IndexedKey<Thread> for IndexedThreadIdKey {
         let room_id = serializer.encode_key_as_string(keys::ROOMS, room_id.as_str());
         let event_id = serializer.encode_key_as_string(keys::EVENTS, event_id);
         Self(room_id, event_id)
+    }
+}
+
+impl IndexedKeyBounds<Thread> for IndexedThreadIdKey {
+    fn lower_key(_: &SafeEncodeSerializer) -> Self {
+        Self((*INDEXED_KEY_LOWER_STRING).clone(), (*INDEXED_KEY_LOWER_STRING).clone())
+    }
+
+    fn upper_key(_: &SafeEncodeSerializer) -> Self {
+        Self((*INDEXED_KEY_UPPER_STRING).clone(), (*INDEXED_KEY_UPPER_STRING).clone())
     }
 }
 

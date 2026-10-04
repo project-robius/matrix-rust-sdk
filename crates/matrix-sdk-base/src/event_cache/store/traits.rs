@@ -131,7 +131,8 @@ pub trait EventCacheStore: AsyncTraitDeps {
     ///
     /// This will empty and remove all the linked chunks stored previously,
     /// using the above [`Self::handle_linked_chunk_updates`] methods. It _also_
-    /// deletes all the events' content.
+    /// deletes all the events' content, and forgets the reply counts of the
+    /// threads, which were based on those events.
     ///
     /// ⚠ This is meant only for super specific use cases, where there shouldn't
     /// be any live in-memory linked chunks. In general, prefer using

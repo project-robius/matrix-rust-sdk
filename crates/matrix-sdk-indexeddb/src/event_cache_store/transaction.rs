@@ -641,6 +641,15 @@ impl<'a> IndexeddbEventCacheStoreTransaction<'a> {
         self.put_item(thread)
     }
 
+    /// List all threads (remembered with [`Self::update_thread_info`]) for all
+    /// rooms.
+    pub async fn get_all_threads(&self) -> Result<Vec<Thread>, TransactionError> {
+        self.get_items_by_key::<Thread, IndexedThreadIdKey>(IndexedKeyRange::all(
+            self.serializer().inner(),
+        ))
+        .await
+    }
+
     /// List all threads (remembered with [`Self::update_thread_info`]) for a
     /// particular room ID.
     pub async fn get_threads_by_room_id(

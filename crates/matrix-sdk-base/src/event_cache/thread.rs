@@ -51,6 +51,13 @@ impl ThreadInfo {
     pub fn new() -> Self {
         Self { number_of_replies: None, latest_event: None, read_receipts: ReadReceipts::default() }
     }
+
+    /// Forget the reply count and the latest event, e.g. once the events they
+    /// were based on are gone, so the thread is uncounted again.
+    pub fn forget_reply_count(&mut self) {
+        self.number_of_replies = None;
+        self.latest_event = None;
+    }
 }
 
 impl Default for ThreadInfo {

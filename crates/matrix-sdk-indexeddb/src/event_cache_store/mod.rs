@@ -508,6 +508,13 @@ impl EventCacheStore for IndexeddbEventCacheStore {
                 transaction.clear::<types::Chunk>()?;
                 transaction.clear::<types::Event>()?;
                 transaction.clear::<types::Gap>()?;
+
+                // The threads' reply counts were based on those events.
+                for mut thread in transaction.get_all_threads().await? {
+                    thread.info.forget_reply_count();
+                    transaction.update_thread_info(&thread)?;
+                }
+
                 transaction.commit().await?;
             }
 
@@ -528,7 +535,7 @@ impl EventCacheStore for IndexeddbEventCacheStore {
 
                 // Delete linked chunks for the thread caches.
                 {
-                    for thread in transaction.get_threads_by_room_id(room_id).await? {
+                    for mut thread in transaction.get_threads_by_room_id(room_id).await? {
                         let linked_chunk_id = thread.linked_chunk();
 
                         // Remove all the items, gaps and events about the
@@ -536,6 +543,10 @@ impl EventCacheStore for IndexeddbEventCacheStore {
                         transaction.delete_chunks_by_linked_chunk_id(linked_chunk_id).await?;
                         transaction.delete_gaps_by_linked_chunk_id(linked_chunk_id).await?;
                         transaction.delete_events_by_linked_chunk_id(linked_chunk_id).await?;
+
+                        // The thread's reply count was based on those events.
+                        thread.info.forget_reply_count();
+                        transaction.update_thread_info(&thread)?;
                     }
                 }
 

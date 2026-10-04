@@ -362,6 +362,30 @@ struct EncodedEvent {
     relates_to: Option<Key>,
 }
 
+/// Forgets the reply counts of the threads of a room, or of all rooms, since
+/// they were based on events that are gone now. Read receipts stay.
+fn forget_thread_reply_counts(
+    txn: &Transaction<'_>,
+    encryption: &Encryption,
+    room_id: Option<&Key>,
+) -> Result<()> {
+    let threads = txn
+        .prepare("SELECT linked_chunk_id, info FROM threads WHERE ?1 IS NULL OR room_id = ?1")?
+        .query_map((room_id,), |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (linked_chunk_id, encoded_thread_info) in threads {
+        let mut thread_info = encryption.decode_thread_info(&encoded_thread_info)?;
+        thread_info.forget_reply_count();
+        txn.execute(
+            "UPDATE threads SET info = ? WHERE linked_chunk_id = ?",
+            (encryption.encode_thread_info(&thread_info)?, linked_chunk_id),
+        )?;
+    }
+
+    Ok(())
+}
+
 trait TransactionExtForLinkedChunks {
     fn rebuild_chunk(
         &self,
@@ -1505,6 +1529,8 @@ impl EventCacheStore for SqliteEventCacheStore {
         match room_id {
             // Clear all events.
             None => {
+                let encryption = self.encryption.clone();
+
                 self.write()
                     .await?
                     .with_transaction(move |txn| {
@@ -1515,7 +1541,7 @@ impl EventCacheStore for SqliteEventCacheStore {
                         // cascading do its job.
                         txn.execute("DELETE FROM events", ())?;
 
-                        Ok(())
+                        forget_thread_reply_counts(txn, &encryption, None)
                     })
                     .await
             }
@@ -1558,10 +1584,10 @@ impl EventCacheStore for SqliteEventCacheStore {
                         // Also clear all the events' contents.
                         txn.execute(
                             "DELETE FROM events WHERE room_id = ?",
-                            (encoded_room_id,),
+                            (&encoded_room_id,),
                         )?;
 
-                        Ok(())
+                        forget_thread_reply_counts(txn, &encryption, Some(&encoded_room_id))
                     })
                     .await
             }

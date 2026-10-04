@@ -40,6 +40,7 @@ use ruma::{
         relation::RelationType,
         room::message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
     },
+    owned_event_id,
     push::Action,
     room_id,
     serde::Raw,
@@ -267,6 +268,10 @@ pub trait EventCacheStoreIntegrationTests {
 
     /// Test that clearing a specific room events and linked chunks works.
     async fn test_clear_all_events_for_specific_room(&self);
+
+    /// Test that clearing events forgets the threads' reply counts, but keeps
+    /// their read receipts.
+    async fn test_clear_all_events_forgets_thread_reply_counts(&self);
 
     /// Test that filtering duplicated events works as expected.
     async fn test_filter_duplicated_events(&self);
@@ -1870,6 +1875,41 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         }
     }
 
+    async fn test_clear_all_events_forgets_thread_reply_counts(&self) {
+        let room_ids = [room_id!("!r0"), room_id!("!r1")];
+        let thread_id = event_id!("$t0");
+
+        let mut counted = ThreadInfo {
+            number_of_replies: Some(3),
+            latest_event: Some(owned_event_id!("$latest")),
+            ..ThreadInfo::new()
+        };
+        counted.read_receipts.num_unread = 1;
+        for room_id in room_ids {
+            self.load_thread_info(room_id, thread_id, true).await.unwrap();
+            self.update_thread_info(room_id, thread_id, &counted).await.unwrap();
+        }
+
+        // Clearing a room only forgets the counts of its own threads.
+        self.clear_all_events(Some(room_ids[0])).await.unwrap();
+        let thread_info =
+            self.load_thread_info(room_ids[0], thread_id, false).await.unwrap().unwrap();
+        assert_eq!(thread_info.number_of_replies, None);
+        assert!(thread_info.latest_event.is_none());
+        assert_eq!(thread_info.read_receipts.num_unread, 1);
+        let thread_info =
+            self.load_thread_info(room_ids[1], thread_id, false).await.unwrap().unwrap();
+        assert_eq!(thread_info.number_of_replies, Some(3));
+
+        // Clearing all rooms forgets all of them.
+        self.clear_all_events(None).await.unwrap();
+        let thread_info =
+            self.load_thread_info(room_ids[1], thread_id, false).await.unwrap().unwrap();
+        assert_eq!(thread_info.number_of_replies, None);
+        assert!(thread_info.latest_event.is_none());
+        assert_eq!(thread_info.read_receipts.num_unread, 1);
+    }
+
     async fn test_filter_duplicated_events(&self) {
         let room_id = room_id!("!r0:matrix.org");
         let linked_chunk_id = LinkedChunkId::Room(room_id);
@@ -2945,6 +2985,13 @@ macro_rules! event_cache_store_integration_tests {
                 let event_cache_store =
                     get_event_cache_store().await.unwrap().into_event_cache_store();
                 event_cache_store.test_clear_all_events_for_specific_room().await;
+            }
+
+            #[async_test]
+            async fn test_clear_all_events_forgets_thread_reply_counts() {
+                let event_cache_store =
+                    get_event_cache_store().await.unwrap().into_event_cache_store();
+                event_cache_store.test_clear_all_events_forgets_thread_reply_counts().await;
             }
 
             #[async_test]
