@@ -1349,11 +1349,39 @@ struct SyncTimelineEventDeserializationHelperV1 {
     /// The push actions associated with this event.
     #[serde(default)]
     push_actions: Vec<Action>,
+
+    /// The thread summary that older versions stored next to the event, after
+    /// stripping the bundled one from the event itself.
+    #[serde(default)]
+    thread_summary: Option<serde_json::Value>,
 }
 
 impl From<SyncTimelineEventDeserializationHelperV1> for TimelineEvent {
     fn from(value: SyncTimelineEventDeserializationHelperV1) -> Self {
-        let SyncTimelineEventDeserializationHelperV1 { kind, timestamp, push_actions } = value;
+        let SyncTimelineEventDeserializationHelperV1 {
+            mut kind,
+            timestamp,
+            push_actions,
+            thread_summary,
+        } = value;
+
+        // Put that older thread summary back into the event, where
+        // `TimelineEvent::thread_summary` looks for it now.
+        if let Some(summary) = thread_summary
+            .as_ref()
+            .and_then(|status| status.get("Some"))
+            .and_then(|summary| ThreadSummary::deserialize(summary).ok())
+        {
+            match &mut kind {
+                TimelineEventKind::Decrypted(decrypted) => {
+                    restore_bundled_thread_summary(&mut decrypted.event, &summary)
+                }
+                TimelineEventKind::UnableToDecrypt { event, .. }
+                | TimelineEventKind::PlainText { event } => {
+                    restore_bundled_thread_summary(event, &summary)
+                }
+            }
+        }
 
         // If `timestamp` is `None`, it is very likely that the event was
         // serialised before the addition of the `timestamp` field. We _could_
@@ -1370,6 +1398,43 @@ impl From<SyncTimelineEventDeserializationHelperV1> for TimelineEvent {
             timestamp,
             push_actions: Some(push_actions),
         }
+    }
+}
+
+/// Puts a thread summary into the event's bundled relations, in the trimmed
+/// form the event cache stores, unless the event already has one.
+fn restore_bundled_thread_summary<T>(event: &mut Raw<T>, summary: &ThreadSummary) {
+    let Ok(mut json) = event.deserialize_as::<serde_json::Value>() else {
+        return;
+    };
+    let Some(relations) = json
+        .as_object_mut()
+        .map(|event| {
+            event.entry("unsigned").or_insert_with(|| serde_json::Value::Object(Default::default()))
+        })
+        .and_then(serde_json::Value::as_object_mut)
+        .map(|unsigned| {
+            unsigned
+                .entry("m.relations")
+                .or_insert_with(|| serde_json::Value::Object(Default::default()))
+        })
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    if relations.contains_key("m.thread") {
+        return;
+    }
+    relations.insert(
+        "m.thread".to_owned(),
+        serde_json::json!({
+            "latest_event": { "event_id": summary.latest_reply },
+            "count": summary.num_replies,
+            "current_user_participated": false,
+        }),
+    );
+    if let Ok(raw) = Raw::new(&json) {
+        *event = raw.cast_unchecked();
     }
 }
 
@@ -1524,7 +1589,7 @@ mod tests {
     use ruma::{
         DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch, UInt, event_id,
         events::{AnySyncTimelineEvent, room::message::RoomMessageEventContent},
-        owned_device_id, owned_user_id,
+        owned_device_id, owned_event_id, owned_user_id,
         serde::Raw,
     };
     use serde::Deserialize;
@@ -1533,7 +1598,7 @@ mod tests {
 
     use super::{
         AlgorithmInfo, DecryptedRoomEvent, DeviceLinkProblem, EncryptionInfo, ShieldState,
-        ShieldStateCode, TimelineEvent, TimelineEventKind, UnableToDecryptInfo,
+        ShieldStateCode, ThreadSummary, TimelineEvent, TimelineEventKind, UnableToDecryptInfo,
         UnableToDecryptReason, UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel,
         VerificationState, WithheldCode,
     };
@@ -2178,6 +2243,45 @@ mod tests {
         assert_eq!(root.bundled_latest_thread_event().unwrap().timestamp_raw(), reply_ts);
         let (_, latest_event) = root.thread_summary_with_latest_event().unwrap();
         assert_eq!(latest_event.timestamp_raw(), reply_ts);
+    }
+
+    #[test]
+    fn test_deserialize_legacy_thread_summary() {
+        // Older versions stored the thread summary next to the event, and
+        // stripped the bundled one from the event itself.
+        let legacy_root = |unsigned: serde_json::Value| {
+            json!({
+                "kind": { "PlainText": { "event": {
+                    "event_id": "$root",
+                    "type": "m.room.message",
+                    "sender": "@alice:example.org",
+                    "origin_server_ts": 42,
+                    "content": { "msgtype": "m.text", "body": "Thread root" },
+                    "unsigned": unsigned,
+                } } },
+                "timestamp": 42,
+                "thread_summary": { "Some": { "latest_reply": "$reply", "num_replies": 5 } },
+            })
+        };
+
+        let event: TimelineEvent = serde_json::from_value(legacy_root(json!({}))).unwrap();
+        assert_eq!(
+            event.thread_summary(),
+            Some(ThreadSummary::new(Some(owned_event_id!("$reply")), 5_u32))
+        );
+        assert!(event.bundled_latest_thread_event().is_none());
+
+        // A bundled summary that's still in the event wins.
+        let bundled = json!({ "m.relations": { "m.thread": {
+            "latest_event": { "event_id": "$newer_reply" },
+            "count": 7,
+            "current_user_participated": true,
+        } } });
+        let event: TimelineEvent = serde_json::from_value(legacy_root(bundled)).unwrap();
+        assert_eq!(
+            event.thread_summary(),
+            Some(ThreadSummary::new(Some(owned_event_id!("$newer_reply")), 7_u32))
+        );
     }
 
     #[test]
