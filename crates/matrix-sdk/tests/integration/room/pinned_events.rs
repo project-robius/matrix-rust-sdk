@@ -8,7 +8,7 @@ use matrix_sdk::{
     test_utils::mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
     timeout::timeout,
 };
-use matrix_sdk_base::event_cache::store::MemoryStore;
+use matrix_sdk_base::event_cache::store::{EventCacheStore as _, MemoryStore};
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{EventId, event_id, owned_event_id, room_id, user_id};
@@ -264,6 +264,74 @@ async fn test_pinned_events_are_loaded_from_network_then_are_reloaded_from_stora
         pinned_event_id,
         "The pinned event should have been reloaded from storage"
     );
+}
+
+#[async_test]
+async fn test_pinned_thread_root_saves_its_bundled_latest_reply() {
+    let room_id = room_id!("!galette:saucisse.bzh");
+    let pinned_event_id = event_id!("$pinned_thread_root");
+    let latest_reply_id = event_id!("$latest_reply");
+
+    let f = EventFactory::new().room(room_id).sender(user_id!("@alice:example.org"));
+
+    // The stored thread root only keeps the ID of its latest reply, so that
+    // reply has to be saved on its own.
+    let pinned_event = f
+        .text_msg("I'm a pinned thread root!")
+        .event_id(pinned_event_id)
+        .with_bundled_thread_summary(
+            f.text_msg("latest reply")
+                .in_thread(pinned_event_id, pinned_event_id)
+                .event_id(latest_reply_id)
+                .into(),
+            3,
+            false,
+        )
+        .into_event();
+
+    let event_cache_store = Arc::new(MemoryStore::new());
+    let server = MatrixMockServer::new().await;
+    server.mock_room_event().match_event_id().ok(pinned_event).mock_once().mount().await;
+
+    let client = server
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::multi_process("test_store"))
+                    .event_cache_store(event_cache_store.clone()),
+            )
+        })
+        .build()
+        .await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    let pinned_events_state = f.room_pinned_events(vec![pinned_event_id.to_owned()]);
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![pinned_events_state.into()]),
+        )
+        .await;
+
+    let (pinned_events_cache, _drop_handles) = event_cache.pinned_events(room_id).await.unwrap();
+    let (events, mut subscriber) = pinned_events_cache.subscribe().await.unwrap();
+    let mut events = events.into();
+
+    // Wait for the background task to load the pinned event from the network.
+    while let Ok(Ok(up)) = timeout(subscriber.recv(), Duration::from_millis(300)).await {
+        for diff in up.diffs {
+            diff.apply(&mut events);
+        }
+        if !events.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(events.len(), 1);
+
+    let latest_reply = event_cache_store.find_event(room_id, latest_reply_id).await.unwrap();
+    assert_eq!(latest_reply.unwrap().event_id(), Some(latest_reply_id));
 }
 
 #[async_test]

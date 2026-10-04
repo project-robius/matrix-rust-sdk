@@ -37,7 +37,7 @@ use tracing::{debug, instrument, trace, warn};
 
 pub(super) use self::updates::PinnedEventsCacheUpdateSender;
 #[cfg(feature = "e2e-encryption")]
-use super::super::redecryptor::MaybeResolvedEvent;
+use super::super::redecryptor::{self, MaybeResolvedEvent};
 use super::{
     super::{
         EventCacheError, EventsOrigin, Result,
@@ -364,7 +364,11 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
         Ok(())
     }
 
-    async fn replace_all_events(&mut self, new_events: Vec<Event>) -> Result<()> {
+    async fn replace_all_events(
+        &mut self,
+        new_events: Vec<Event>,
+        #[cfg_attr(not(feature = "e2e-encryption"), allow(unused_variables))] room: &Room,
+    ) -> Result<()> {
         trace!("resetting all pinned events in linked chunk");
 
         let previous_pinned_event_ids = self.state.current_event_ids();
@@ -378,6 +382,17 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
         {
             // No change in the list of pinned events.
             return Ok(());
+        }
+
+        // A stored thread root only keeps its latest reply's ID, so we save
+        // that reply on its own, like the room and thread caches do.
+        for event in &new_events {
+            #[cfg_attr(not(feature = "e2e-encryption"), allow(unused_mut))]
+            if let Some(mut latest_event) = event.bundled_latest_thread_event() {
+                #[cfg(feature = "e2e-encryption")]
+                redecryptor::try_decrypt_in_place(&mut latest_event, Some(room)).await;
+                self.save_events([latest_event]).await?;
+            }
         }
 
         if self.state.chunk.events().next().is_some() {
@@ -598,7 +613,7 @@ impl PinnedEventsCache {
         debug!("pinned events listener task started");
 
         let reload_from_network = async |room: Room| {
-            let events = match Self::reload_pinned_events(room).await {
+            let events = match Self::reload_pinned_events(room.clone()).await {
                 Ok(Some(events)) => events,
                 Ok(None) => Vec::new(),
                 Err(err) => {
@@ -611,7 +626,7 @@ impl PinnedEventsCache {
             // propagate updates to the observers.
             match inner.state.write().await {
                 Ok(mut guard) => {
-                    guard.replace_all_events(events).await.unwrap_or_else(|err| {
+                    guard.replace_all_events(events, &room).await.unwrap_or_else(|err| {
                         warn!("error when replacing pinned events: {err}");
                     });
                 }
