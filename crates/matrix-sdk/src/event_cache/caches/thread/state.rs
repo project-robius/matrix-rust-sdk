@@ -566,8 +566,19 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
     /// Update the [`ThreadSummary`] for this thread, and return a copy of it.
     ///
-    /// Returns `None` if we haven't seen any of the thread's replies yet.
+    /// Returns `None` while the thread is uncounted, until one of its replies
+    /// shows up in its own timeline.
     pub(super) async fn update_thread_summary(&mut self) -> Result<Option<ThreadSummary>> {
+        // The count below has the root's bundled reply, saved on its own, so
+        // the thread stays uncounted until a reply lands in its own timeline.
+        if self.state.thread_info.read().await.number_of_replies.is_none()
+            && !self.thread_linked_chunk().events().any(|(_position, event)| {
+                extract_thread_root(event.raw()).as_deref() == Some(&*self.thread_id)
+            })
+        {
+            return Ok(None);
+        }
+
         // Read the latest number of thread replies from the store.
         //
         // Implementation note: since this is based on the `m.relates_to`
@@ -579,16 +590,6 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
             .find_event_relations(&self.room_id, &self.thread_id, Some(&[RelationType::Thread]))
             .await?
             .len();
-
-        // That count includes the root's bundled reply, saved on its own, so
-        // the thread stays uncounted until a reply lands in its own timeline.
-        if self.state.thread_info.read().await.number_of_replies.is_none()
-            && !self.thread_linked_chunk().events().any(|(_position, event)| {
-                extract_thread_root(event.raw()).as_deref() == Some(&*self.thread_id)
-            })
-        {
-            return Ok(None);
-        }
 
         // Find the latest event ID, if and only if we consider there is at
         // least 1 reply.
