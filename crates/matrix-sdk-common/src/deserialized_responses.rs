@@ -693,12 +693,22 @@ impl TimelineEvent {
 
         match latest_event.get_field::<MessageLikeEventType>("type") {
             Ok(None) => {
-                let event_id = latest_event.get_field::<OwnedEventId>("event_id").ok().flatten();
-                warn!(
-                    ?event_id,
-                    "couldn't deserialize bundled latest thread event: missing `type` field \
-                     in bundled latest thread event"
-                );
+                // The event cache trims stored bundles down to the latest
+                // event's ID, which isn't worth a warning.
+                if latest_event
+                    .get_field::<serde::de::IgnoredAny>("content")
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    let event_id =
+                        latest_event.get_field::<OwnedEventId>("event_id").ok().flatten();
+                    warn!(
+                        ?event_id,
+                        "couldn't deserialize bundled latest thread event: missing `type` field \
+                         in bundled latest thread event"
+                    );
+                }
                 None
             }
 
@@ -2281,6 +2291,18 @@ mod tests {
         assert_eq!(
             event.thread_summary(),
             Some(ThreadSummary::new(Some(owned_event_id!("$newer_reply")), 7_u32))
+        );
+    }
+
+    #[test]
+    fn test_bundled_latest_thread_event_trimmed_to_its_id() {
+        // That's how the event cache stores a thread root's bundle.
+        let root = thread_root_with_latest_event(json!({ "event_id": "$reply" }));
+
+        assert!(root.bundled_latest_thread_event().is_none());
+        assert_eq!(
+            root.thread_summary(),
+            Some(ThreadSummary::new(Some(owned_event_id!("$reply")), 2_u32))
         );
     }
 
