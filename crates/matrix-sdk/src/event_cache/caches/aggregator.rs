@@ -163,7 +163,7 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
                     let mut associated_thread_root = None;
 
                     for thread in existing_threads.values() {
-                        if thread.find_event(&redaction_target).await?.is_some() {
+                        if thread.has_event_in_own_timeline(&redaction_target).await? {
                             associated_thread_root = Some(thread.thread_id.clone());
                             break;
                         }
