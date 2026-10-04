@@ -31,8 +31,8 @@ pub struct ThreadInfo {
     ///
     /// Thus, it can be zero!
     ///
-    /// It's `None` until one of the thread's replies shows up in the thread's
-    /// own timeline, e.g. while it only holds read receipts, or after a clear.
+    /// It's `None` until a synced reply or redaction lands in the thread's own
+    /// timeline, e.g. while it only holds read receipts, or after a clear.
     // Older builds stored a plain count, with 0 for uncounted threads too, so
     // this uses a new key and their counts read back as `None`.
     #[serde(default, rename = "counted_replies")]
