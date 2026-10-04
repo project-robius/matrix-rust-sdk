@@ -31,9 +31,11 @@ pub struct ThreadInfo {
     ///
     /// Thus, it can be zero!
     ///
-    /// It's `None` until the event cache has seen one of the thread's replies,
-    /// e.g. when the thread info was only created to hold its read receipts.
-    #[serde(default)] // For backwards compatibility.
+    /// It's `None` until one of the thread's replies shows up in the thread's
+    /// own timeline, e.g. while it only holds read receipts, or after a clear.
+    // Older builds stored a plain count, with 0 for uncounted threads too, so
+    // this uses a new key and their counts read back as `None`.
+    #[serde(default, rename = "counted_replies")]
     pub number_of_replies: Option<u32>,
 
     /// The ID of the latest event in the thread, if any.
@@ -54,5 +56,27 @@ impl ThreadInfo {
 impl Default for ThreadInfo {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::ThreadInfo;
+
+    #[test]
+    fn test_older_number_of_replies_reads_back_as_uncounted() {
+        let mut stored = serde_json::to_value(ThreadInfo::new()).unwrap();
+        let stored_object = stored.as_object_mut().unwrap();
+        stored_object.remove("counted_replies");
+        stored_object.insert("number_of_replies".to_owned(), json!(0));
+        let thread_info: ThreadInfo = serde_json::from_value(stored).unwrap();
+        assert_eq!(thread_info.number_of_replies, None);
+
+        let counted = ThreadInfo { number_of_replies: Some(3), ..ThreadInfo::new() };
+        let thread_info: ThreadInfo =
+            serde_json::from_value(serde_json::to_value(counted).unwrap()).unwrap();
+        assert_eq!(thread_info.number_of_replies, Some(3));
     }
 }
