@@ -1377,11 +1377,15 @@ impl From<SyncTimelineEventDeserializationHelperV1> for TimelineEvent {
 
         // Put that older thread summary back into the event, where
         // `TimelineEvent::thread_summary` looks for it now.
-        if let Some(summary) = thread_summary
+        if let Some(mut summary) = thread_summary
             .as_ref()
             .and_then(|status| status.get("Some"))
             .and_then(|summary| ThreadSummary::deserialize(summary).ok())
         {
+            // Older versions could pick a thread root as its own latest reply.
+            if summary.latest_reply.is_some() && summary.latest_reply == kind.parse_event_id() {
+                summary.latest_reply = None;
+            }
             match &mut kind {
                 TimelineEventKind::Decrypted(decrypted) => {
                     restore_bundled_thread_summary(&mut decrypted.event, &summary)
@@ -2292,6 +2296,12 @@ mod tests {
             event.thread_summary(),
             Some(ThreadSummary::new(Some(owned_event_id!("$newer_reply")), 7_u32))
         );
+
+        // A root that was stored as its own latest reply keeps only its count.
+        let mut root_as_latest = legacy_root(json!({}));
+        root_as_latest["thread_summary"]["Some"]["latest_reply"] = json!("$root");
+        let event: TimelineEvent = serde_json::from_value(root_as_latest).unwrap();
+        assert_eq!(event.thread_summary(), Some(ThreadSummary::new(None, 5_u32)));
     }
 
     #[test]
