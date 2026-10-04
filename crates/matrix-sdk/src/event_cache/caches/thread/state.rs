@@ -551,14 +551,16 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
     /// Update the [`ThreadSummary`] for this thread, and return a copy of it.
     ///
-    /// Returns `None` while the thread is uncounted, until one of its replies
-    /// shows up in its own timeline.
+    /// Returns `None` while the thread is uncounted, until one of its replies,
+    /// or a redaction, shows up in its own timeline.
     pub(super) async fn update_thread_summary(&mut self) -> Result<Option<ThreadSummary>> {
-        // The count below has the root's bundled reply, saved on its own, so
-        // the thread stays uncounted until a reply lands in its own timeline.
+        // Counting would include the root's bundled reply, so the thread stays
+        // uncounted until a reply or a redaction lands in its own timeline.
         if self.state.thread_info.read().await.number_of_replies.is_none()
             && !self.thread_linked_chunk().events().any(|(_position, event)| {
                 extract_thread_root(event.raw()).as_deref() == Some(&*self.thread_id)
+                    || extract_redaction_target(event.raw(), &self.room_version_rules.redaction)
+                        .is_some_and(|target| target != self.thread_id)
             })
         {
             return Ok(None);

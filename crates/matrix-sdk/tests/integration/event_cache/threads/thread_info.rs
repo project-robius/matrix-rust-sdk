@@ -453,3 +453,60 @@ async fn test_reaction_redaction_goes_to_its_thread() {
     let reaction = events.iter().find(|event| event.event_id() == Some(reaction_id)).unwrap();
     assert!(reaction.raw().deserialize().unwrap().is_redacted());
 }
+
+/// A redaction in a thread that isn't counted yet counts it, since the summary
+/// bundled with its root is stale now.
+#[async_test]
+async fn test_redaction_counts_an_uncounted_thread() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    let room_id = room_id!("!r");
+    let thread_id = event_id!("$t");
+    let latest_reply_id = event_id!("$latest_reply");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+
+    server.sync_joined_room(&client, room_id).await;
+    let (thread, _drop_handles) = event_cache.thread(room_id, thread_id).await.unwrap();
+    let (_, mut thread_stream) = thread.subscribe().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("thread root").event_id(thread_id).with_bundled_thread_summary(
+                    f.text_msg("latest reply")
+                        .in_thread(thread_id, thread_id)
+                        .event_id(latest_reply_id)
+                        .into(),
+                    42,
+                    false,
+                ),
+            ),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(f.redaction(latest_reply_id)),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+    assert_let_timeout!(Ok(ThreadEventCacheUpdate::UpdateSummary(summary)) = thread_stream.recv());
+    assert_eq!(summary.num_replies, 0);
+    assert!(summary.latest_reply.is_none());
+
+    let thread_info = event_cache.thread_info(room_id, thread_id).await.unwrap().unwrap();
+    assert_eq!(thread_info.number_of_replies, Some(0));
+}
