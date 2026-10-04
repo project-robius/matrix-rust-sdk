@@ -207,12 +207,10 @@ async fn test_ignored_user_empties_threads() {
         assert_eq!(diffs.len(), 1);
         assert_let!(VectorDiff::Clear = &diffs[0]);
 
-        // The thread summary is cleared too.
-        assert_let_timeout!(
-            Ok(ThreadEventCacheUpdate::UpdateSummary(thread_summary)) = thread_stream.recv()
-        );
-        assert_eq!(thread_summary.num_replies, 0);
-        assert!(thread_summary.latest_reply.is_none());
+        // The thread's reply count is unknown again, rather than zero.
+        let thread_info = event_cache.thread_info(room_id, thread_root).await.unwrap().unwrap();
+        assert_eq!(thread_info.number_of_replies, None);
+        assert!(thread_info.latest_event.is_none());
     }
 
     // Receiving new events still works.

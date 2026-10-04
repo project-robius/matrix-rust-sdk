@@ -390,6 +390,13 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
                 // the start of the timeline, since we don't know about that
                 // anymore.
                 *self.waited_for_initial_prev_token_mut() = false;
+
+                // The events are gone, so the reply count is unknown again.
+                self.update_thread_info(|thread_info| {
+                    thread_info.number_of_replies = None;
+                    thread_info.latest_event = None;
+                })
+                .await?;
             }
 
             ReloadPreprocessing::None => {}
