@@ -19,6 +19,7 @@ use itertools::Itertools as _;
 use matrix_sdk::deserialized_responses::{
     ThreadSummary as SdkThreadSummary, TimelineEvent, TimelineEventKind, UnsignedEventLocation,
 };
+use matrix_sdk_common::serde_helpers::extract_relation;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, UserId,
     events::AnySyncTimelineEvent, push::Action, serde::Raw,
@@ -810,8 +811,11 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         //
         // We have no choice here: we must fetch the `ThreadInfo` for each new
         // event. Receiving a new event doesn't happen in a hot loop, so
-        // it should not impact performance too much.
-        let sdk_thread_summary = if let Some(event_id) = event.event_id() {
+        // it should not impact performance too much. An event with a relation,
+        // e.g. a thread reply, can't be a thread root though, so we skip it.
+        let sdk_thread_summary = if let Some(event_id) = event.event_id()
+            && extract_relation(event.raw()).is_none()
+        {
             // Read the thread summary data from the `ThreadInfo` if it exists
             // in the Event Cache, because they are the most
             // up-to-date.
