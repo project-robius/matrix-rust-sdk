@@ -852,7 +852,8 @@ impl TimelineEvent {
         Self::from_bundled_latest_event(
             &self.kind,
             bundled_thread.latest_event,
-            self.timestamp_raw().unwrap_or_else(MilliSecondsSinceUnixEpoch::now),
+            // The reply is newer than its root, so only cap its timestamp at now.
+            MilliSecondsSinceUnixEpoch::now(),
         )
     }
 
@@ -878,7 +879,8 @@ impl TimelineEvent {
                 Self::from_bundled_latest_event(
                     &self.kind,
                     bundled_thread.latest_event,
-                    self.timestamp_raw().unwrap_or_else(MilliSecondsSinceUnixEpoch::now),
+                    // The reply is newer than its root, so only cap its timestamp at now.
+                    MilliSecondsSinceUnixEpoch::now(),
                 )?,
             ))
         })
@@ -2133,6 +2135,49 @@ mod tests {
         assert_let!(TimelineEventKind::UnableToDecrypt { utd_info, .. } = result.kind);
         assert!(utd_info.session_id.is_some());
         assert_eq!(utd_info.session_id.unwrap(), session_id);
+    }
+
+    fn thread_root_with_latest_event(latest_event: serde_json::Value) -> TimelineEvent {
+        TimelineEvent::from_plaintext(
+            Raw::new(&json!({
+                "event_id": "$root",
+                "type": "m.room.message",
+                "sender": "@alice:example.org",
+                "origin_server_ts": 42,
+                "content": { "msgtype": "m.text", "body": "Thread root" },
+                "unsigned": {
+                    "m.relations": {
+                        "m.thread": {
+                            "latest_event": latest_event,
+                            "count": 2,
+                            "current_user_participated": false,
+                        },
+                    },
+                },
+            }))
+            .unwrap()
+            .cast_unchecked(),
+        )
+    }
+
+    #[test]
+    fn test_bundled_latest_thread_event_keeps_its_own_timestamp() {
+        let root = thread_root_with_latest_event(json!({
+            "event_id": "$reply",
+            "type": "m.room.message",
+            "sender": "@bob:example.org",
+            "origin_server_ts": 153,
+            "content": {
+                "msgtype": "m.text",
+                "body": "Latest reply",
+                "m.relates_to": { "rel_type": "m.thread", "event_id": "$root" },
+            },
+        }));
+        let reply_ts = Some(MilliSecondsSinceUnixEpoch(UInt::new_saturating(153)));
+
+        assert_eq!(root.bundled_latest_thread_event().unwrap().timestamp_raw(), reply_ts);
+        let (_, latest_event) = root.thread_summary_with_latest_event().unwrap();
+        assert_eq!(latest_event.timestamp_raw(), reply_ts);
     }
 
     #[test]
