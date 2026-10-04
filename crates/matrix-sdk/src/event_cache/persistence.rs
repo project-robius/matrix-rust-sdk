@@ -21,7 +21,7 @@ use matrix_sdk_base::{
     linked_chunk::{ChunkMetadata, LinkedChunkId, OwnedLinkedChunkId, Update},
 };
 use ruma::{
-    EventId, RoomId,
+    EventId, MilliSecondsSinceUnixEpoch, RoomId,
     events::{AnySyncTimelineEvent, relation::RelationType},
     serde::Raw,
 };
@@ -322,12 +322,13 @@ pub(super) fn redact_keeping_thread_summary(
     }
 }
 
-/// Whether a thread root's bundled copy of `event` is worth saving. It's a
-/// snapshot, so a stored copy wins unless that one couldn't be decrypted.
+/// Whether a thread root's bundled copy of `event` is worth saving. A stored
+/// copy wins unless it couldn't be decrypted, or has a capped timestamp.
 pub(super) async fn is_bundled_copy_worth_saving(
     store: &EventCacheStoreLockGuard,
     room_id: &RoomId,
     event: &Event,
+    root_timestamp: Option<MilliSecondsSinceUnixEpoch>,
 ) -> Result<bool> {
     let Some(event_id) = event.event_id() else {
         return Ok(false);
@@ -339,8 +340,12 @@ pub(super) async fn is_bundled_copy_worth_saving(
             false
         }
         Some(stored) => {
-            matches!(stored.kind, TimelineEventKind::UnableToDecrypt { .. })
-                && !matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. })
+            (matches!(stored.kind, TimelineEventKind::UnableToDecrypt { .. })
+                && !matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. }))
+                // Older versions capped a bundled copy's timestamp at its root's.
+                || (root_timestamp.is_some()
+                    && stored.timestamp_raw() == root_timestamp
+                    && event.timestamp_raw() != root_timestamp)
         }
     })
 }

@@ -494,8 +494,13 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
                 // can't be decrypted.
                 #[cfg(feature = "e2e-encryption")]
                 redecryptor::try_decrypt_in_place(&mut bundled_thread, room.as_ref()).await;
-                if is_bundled_copy_worth_saving(&self.store, &self.state.room_id, &bundled_thread)
-                    .await?
+                if is_bundled_copy_worth_saving(
+                    &self.store,
+                    &self.state.room_id,
+                    &bundled_thread,
+                    event.timestamp_raw(),
+                )
+                .await?
                 {
                     self.save_events([bundled_thread]).await?;
                 }

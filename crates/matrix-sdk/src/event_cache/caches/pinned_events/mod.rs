@@ -393,8 +393,13 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
             if let Some(mut latest_event) = event.bundled_latest_thread_event() {
                 #[cfg(feature = "e2e-encryption")]
                 redecryptor::try_decrypt_in_place(&mut latest_event, Some(room)).await;
-                if is_bundled_copy_worth_saving(&self.store, &self.state.room_id, &latest_event)
-                    .await?
+                if is_bundled_copy_worth_saving(
+                    &self.store,
+                    &self.state.room_id,
+                    &latest_event,
+                    event.timestamp_raw(),
+                )
+                .await?
                 {
                     self.save_events([latest_event]).await?;
                 }

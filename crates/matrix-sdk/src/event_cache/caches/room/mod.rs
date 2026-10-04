@@ -791,11 +791,11 @@ mod timed_tests {
     use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use matrix_sdk_test::{ALICE, BOB, async_test, event_factory::EventFactory};
     use ruma::{
-        EventId, event_id,
+        EventId, MilliSecondsSinceUnixEpoch, event_id,
         events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent},
         room_id,
         serde::Raw,
-        user_id,
+        uint, user_id,
     };
     use serde_json::json;
     use strass::assert_let;
@@ -1242,6 +1242,61 @@ mod timed_tests {
 
         let stored_reply = event_cache_store.find_event(room_id, reply_id).await.unwrap().unwrap();
         assert!(stored_reply.raw().deserialize().unwrap().is_redacted());
+    }
+
+    #[async_test]
+    async fn test_bundled_copy_repairs_a_capped_timestamp() {
+        let room_id = room_id!("!galette:saucisse.bzh");
+        let thread_root_id = event_id!("$thread_root");
+        let reply_id = event_id!("$reply");
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+        let reply =
+            || f.text_msg("reply").in_thread(thread_root_id, thread_root_id).event_id(reply_id);
+
+        // An older version saved the reply with its root's timestamp.
+        let event_cache_store = Arc::new(MemoryStore::new());
+        let mut capped_reply = reply().server_ts(2000).into_event();
+        capped_reply.timestamp = Some(MilliSecondsSinceUnixEpoch(uint!(1000)));
+        event_cache_store.save_event(room_id, capped_reply).await.unwrap();
+
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new(CrossProcessLockConfig::multi_process("hodor"))
+                        .event_cache_store(event_cache_store.clone()),
+                )
+            })
+            .build()
+            .await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+        // Then its root shows up again, bundling a fresh copy of the reply.
+        let root = f
+            .text_msg("thread root")
+            .event_id(thread_root_id)
+            .server_ts(1000)
+            .with_bundled_thread_summary(reply().server_ts(2000).into(), 1, false)
+            .into_event();
+        let timeline = Timeline { limited: false, prev_batch: None, events: vec![root] };
+        room_event_cache
+            .handle_joined_room_update(
+                timeline,
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let stored_reply = event_cache_store.find_event(room_id, reply_id).await.unwrap().unwrap();
+        assert_eq!(stored_reply.timestamp_raw(), Some(MilliSecondsSinceUnixEpoch(uint!(2000))));
     }
 
     #[async_test]
