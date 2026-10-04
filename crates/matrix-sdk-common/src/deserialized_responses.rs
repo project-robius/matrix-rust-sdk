@@ -1596,7 +1596,13 @@ impl ProcessedToDeviceEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use assert_matches::assert_matches;
     use insta::{assert_json_snapshot, with_settings};
@@ -2309,11 +2315,56 @@ mod tests {
         // That's how the event cache stores a thread root's bundle.
         let root = thread_root_with_latest_event(json!({ "event_id": "$reply" }));
 
-        assert!(root.bundled_latest_thread_event().is_none());
+        let warnings = WarningCounter::default();
+        let latest_event = tracing::subscriber::with_default(warnings.clone(), || {
+            root.bundled_latest_thread_event()
+        });
+        assert!(latest_event.is_none());
+        assert_eq!(warnings.count(), 0);
         assert_eq!(
             root.thread_summary(),
             Some(ThreadSummary::new(Some(owned_event_id!("$reply")), 2_u32))
         );
+
+        // A bundle that's actually malformed is still worth a warning.
+        let root = thread_root_with_latest_event(json!({ "event_id": "$reply", "content": {} }));
+        let latest_event = tracing::subscriber::with_default(warnings.clone(), || {
+            root.bundled_latest_thread_event()
+        });
+        assert!(latest_event.is_none());
+        assert_eq!(warnings.count(), 1);
+    }
+
+    /// Counts the warnings logged while it's the default subscriber.
+    #[derive(Clone, Default)]
+    struct WarningCounter(Arc<AtomicUsize>);
+
+    impl WarningCounter {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl tracing::Subscriber for WarningCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     #[test]
