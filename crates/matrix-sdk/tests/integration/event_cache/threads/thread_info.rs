@@ -18,7 +18,16 @@ use matrix_sdk::{
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{ALICE, JoinedRoomBuilder, async_test, event_factory::EventFactory};
-use ruma::{EventId, event_id, room_id};
+use ruma::{
+    EventId, event_id,
+    events::{
+        relation::Thread,
+        room::encrypted::{
+            EncryptedEventScheme, MegolmV1AesSha2ContentInit, Relation, RoomEncryptedEventContent,
+        },
+    },
+    owned_device_id, room_id,
+};
 
 /// A thread isn't counted until a reply shows up in its own timeline, even
 /// though the latest reply bundled with its root gets saved on its own.
@@ -82,6 +91,63 @@ async fn test_thread_info_is_not_counted_before_a_reply_shows_up() {
 
     let thread_info = event_cache.thread_info(room_id, thread_id).await.unwrap().unwrap();
     assert_eq!(thread_info.number_of_replies, Some(2));
+}
+
+/// A thread's root is never its own latest reply, even when none of the replies
+/// can be shown, e.g. because they can't be decrypted.
+#[async_test]
+async fn test_thread_root_is_never_its_own_latest_reply() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    let room_id = room_id!("!r");
+    let thread_id = event_id!("$t");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+
+    server.sync_joined_room(&client, room_id).await;
+    let (thread, _drop_handles) = event_cache.thread(room_id, thread_id).await.unwrap();
+    let (_, mut thread_stream) = thread.subscribe().await.unwrap();
+
+    // The root lands in the thread's own timeline.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("thread root").event_id(thread_id)),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+
+    // Then a reply shows up, which we can't decrypt.
+    let utd_reply = f
+        .event(RoomEncryptedEventContent::new(
+            EncryptedEventScheme::MegolmV1AesSha2(
+                MegolmV1AesSha2ContentInit {
+                    ciphertext: "ciphertext".to_owned(),
+                    sender_key: "sender_key".to_owned(),
+                    device_id: owned_device_id!("DEVICE"),
+                    session_id: "session".to_owned(),
+                }
+                .into(),
+            ),
+            Some(Relation::Thread(Thread::plain(thread_id.to_owned(), thread_id.to_owned()))),
+        ))
+        .event_id(event_id!("$utd_reply"));
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(utd_reply)).await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+
+    assert_let_timeout!(Ok(ThreadEventCacheUpdate::UpdateSummary(summary)) = thread_stream.recv());
+    assert_eq!(summary.num_replies, 1);
+    assert!(summary.latest_reply.is_none());
 }
 
 /// A thread root redacted while its thread cache holds it keeps its thread
