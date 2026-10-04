@@ -1099,6 +1099,73 @@ mod timed_tests {
     }
 
     #[async_test]
+    async fn test_bundled_copy_does_not_overwrite_a_stored_event() {
+        let room_id = room_id!("!galette:saucisse.bzh");
+        let thread_root_id = event_id!("$thread_root");
+        let reply_id = event_id!("$reply");
+        let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));
+
+        let event_cache_store = Arc::new(MemoryStore::new());
+
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new(CrossProcessLockConfig::multi_process("hodor"))
+                        .event_cache_store(event_cache_store.clone()),
+                )
+            })
+            .build()
+            .await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        client.base_client().get_or_create_room(room_id, RoomState::Joined);
+        let room = client.get_room(room_id).unwrap();
+        let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
+
+        // A thread reply gets stored, then redacted.
+        let reply =
+            || f.text_msg("secret").in_thread(thread_root_id, thread_root_id).event_id(reply_id);
+        let timeline = Timeline {
+            limited: false,
+            prev_batch: None,
+            events: vec![reply().into_event(), f.redaction(reply_id).into_event()],
+        };
+        room_event_cache
+            .handle_joined_room_update(
+                timeline,
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        // Then its root shows up, bundling a copy of the reply from before.
+        let root = f
+            .text_msg("thread root")
+            .event_id(thread_root_id)
+            .with_bundled_thread_summary(reply().into(), 1, false)
+            .into_event();
+        let timeline = Timeline { limited: false, prev_batch: None, events: vec![root] };
+        room_event_cache
+            .handle_joined_room_update(
+                timeline,
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let stored_reply = event_cache_store.find_event(room_id, reply_id).await.unwrap().unwrap();
+        assert!(stored_reply.raw().deserialize().unwrap().is_redacted());
+    }
+
+    #[async_test]
     async fn test_clear() {
         let room_id = room_id!("!galette:saucisse.bzh");
         let f = EventFactory::new().room(room_id).sender(user_id!("@ben:saucisse.bzh"));

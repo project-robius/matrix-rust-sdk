@@ -46,8 +46,8 @@ use super::{
             EventCacheError, Result,
             deduplicator::{DeduplicationOutcome, filter_duplicate_events},
             persistence::{
-                find_event, find_event_with_relations, keep_bundled_thread_on_redaction,
-                load_linked_chunk_metadata, send_updates_to_store,
+                find_event, find_event_with_relations, is_bundled_copy_worth_saving,
+                load_linked_chunk_metadata, redact_keeping_thread_summary, send_updates_to_store,
             },
             states::{ReloadPreprocessing, StateLockReadGuard, StateLockWriteGuard},
         },
@@ -502,7 +502,11 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
                 // can't be decrypted.
                 #[cfg(feature = "e2e-encryption")]
                 redecryptor::try_decrypt_in_place(&mut bundled_thread, room.as_ref()).await;
-                self.save_events([bundled_thread]).await?;
+                if is_bundled_copy_worth_saving(&self.store, &self.state.room_id, &bundled_thread)
+                    .await?
+                {
+                    self.save_events([bundled_thread]).await?;
+                }
             }
         }
 
@@ -711,8 +715,7 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
             //   under the hood.
             // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this
             //   case.
-            let redacted_event = keep_bundled_thread_on_redaction(target_event_raw, redacted_event);
-            target_event.replace_raw(redacted_event.cast_unchecked());
+            redact_keeping_thread_summary(&mut target_event, redacted_event);
 
             self.replace_event_at(location, target_event.clone()).await?;
         }

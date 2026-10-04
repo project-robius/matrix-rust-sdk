@@ -84,6 +84,65 @@ async fn test_thread_info_is_not_counted_before_a_reply_shows_up() {
     assert_eq!(thread_info.number_of_replies, Some(2));
 }
 
+/// A thread root redacted while its thread cache holds it keeps its thread
+/// summary in the store.
+#[async_test]
+async fn test_redacted_thread_root_keeps_its_summary() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    let room_id = room_id!("!r");
+    let thread_id = event_id!("$t");
+    let latest_reply_id = event_id!("$latest_reply");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+
+    server.sync_joined_room(&client, room_id).await;
+    let (thread, _drop_handles) = event_cache.thread(room_id, thread_id).await.unwrap();
+    let (_, mut thread_stream) = thread.subscribe().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("thread root").event_id(thread_id).with_bundled_thread_summary(
+                    f.text_msg("latest reply")
+                        .in_thread(thread_id, thread_id)
+                        .event_id(latest_reply_id)
+                        .into(),
+                    42,
+                    false,
+                ),
+            ),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(f.redaction(thread_id)),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+
+    let store = client.event_cache_store().lock().await.unwrap();
+    let stored_root =
+        store.as_clean().unwrap().find_event(room_id, thread_id).await.unwrap().unwrap();
+    assert!(stored_root.raw().deserialize().unwrap().is_redacted());
+    let summary = stored_root.thread_summary().unwrap();
+    assert_eq!(summary.num_replies, 42);
+    assert_eq!(summary.latest_reply.as_deref(), Some(latest_reply_id));
+}
+
 /// A redaction goes to the thread whose own timeline holds its target, even
 /// when other threads are loaded too.
 #[async_test]

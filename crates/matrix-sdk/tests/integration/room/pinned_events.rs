@@ -1,7 +1,7 @@
 use std::{ops::Not as _, sync::Arc};
 
 use matrix_sdk::{
-    Room,
+    Room, assert_let_timeout,
     linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     room::IncludeRelations,
     store::StoreConfig,
@@ -267,7 +267,7 @@ async fn test_pinned_events_are_loaded_from_network_then_are_reloaded_from_stora
 }
 
 #[async_test]
-async fn test_pinned_thread_root_saves_its_bundled_latest_reply() {
+async fn test_pinned_thread_root_keeps_its_thread_data() {
     let room_id = room_id!("!galette:saucisse.bzh");
     let pinned_event_id = event_id!("$pinned_thread_root");
     let latest_reply_id = event_id!("$latest_reply");
@@ -332,6 +332,22 @@ async fn test_pinned_thread_root_saves_its_bundled_latest_reply() {
 
     let latest_reply = event_cache_store.find_event(room_id, latest_reply_id).await.unwrap();
     assert_eq!(latest_reply.unwrap().event_id(), Some(latest_reply_id));
+
+    // Redacting the pinned thread root keeps its thread summary.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(f.redaction(pinned_event_id)),
+        )
+        .await;
+    assert_let_timeout!(Ok(_) = subscriber.recv());
+
+    let stored_root =
+        event_cache_store.find_event(room_id, pinned_event_id).await.unwrap().unwrap();
+    assert!(stored_root.raw().deserialize().unwrap().is_redacted());
+    let summary = stored_root.thread_summary().unwrap();
+    assert_eq!(summary.num_replies, 3);
+    assert_eq!(summary.latest_reply.as_deref(), Some(latest_reply_id));
 }
 
 #[async_test]

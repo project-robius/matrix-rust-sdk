@@ -276,9 +276,8 @@ fn strip_relations_if_present<T>(event: &mut Raw<T>) {
         let unsigned_obj = unsigned.as_object_mut()?;
         let mut relations = unsigned_obj.remove("m.relations")?;
         if let Some(thread) = relations.get_mut("m.thread")
-            && let Some(latest_event) = thread.get_mut("latest_event")
+            && trim_bundled_thread(thread).is_some()
         {
-            *latest_event = serde_json::json!({ "event_id": latest_event.get("event_id") });
             unsigned_obj
                 .insert("m.relations".to_owned(), serde_json::json!({ "m.thread": thread.take() }));
         }
@@ -288,15 +287,24 @@ fn strip_relations_if_present<T>(event: &mut Raw<T>) {
     let _ = closure();
 }
 
-/// Copies the bundled thread summary of `original` into its `redacted` form,
-/// since a redacted thread root is still a thread root.
-pub(super) fn keep_bundled_thread_on_redaction(
-    original: &Raw<AnySyncTimelineEvent>,
+/// Trims a bundled thread summary's latest event down to its ID, since that
+/// event is saved on its own.
+fn trim_bundled_thread(thread: &mut serde_json::Value) -> Option<()> {
+    let latest_event = thread.get_mut("latest_event")?;
+    *latest_event = serde_json::json!({ "event_id": latest_event.get("event_id") });
+    Some(())
+}
+
+/// Replaces `event` with its `redacted` form, keeping its trimmed thread
+/// summary, since a redacted thread root is still a thread root.
+pub(super) fn redact_keeping_thread_summary(
+    event: &mut Event,
     redacted: Raw<AnySyncTimelineEvent>,
-) -> Raw<AnySyncTimelineEvent> {
+) {
     let with_thread = || -> Option<Raw<AnySyncTimelineEvent>> {
-        let unsigned = original.get_field::<serde_json::Value>("unsigned").ok()??;
-        let thread = unsigned.get("m.relations")?.get("m.thread")?;
+        let unsigned = event.raw().get_field::<serde_json::Value>("unsigned").ok()??;
+        let mut thread = unsigned.get("m.relations")?.get("m.thread")?.clone();
+        trim_bundled_thread(&mut thread)?;
         let mut val: serde_json::Value = redacted.deserialize_as().ok()?;
         val.as_object_mut()?
             .entry("unsigned")
@@ -305,7 +313,32 @@ pub(super) fn keep_bundled_thread_on_redaction(
             .insert("m.relations".to_owned(), serde_json::json!({ "m.thread": thread }));
         Raw::new(&val).ok().map(Raw::cast_unchecked)
     };
-    with_thread().unwrap_or(redacted)
+    let redacted = with_thread().unwrap_or(redacted);
+    event.replace_raw(redacted.cast_unchecked());
+
+    // The bundled events this was about are gone.
+    if let TimelineEventKind::Decrypted(decrypted) = &mut event.kind {
+        decrypted.unsigned_encryption_info = None;
+    }
+}
+
+/// Whether a thread root's bundled copy of `event` is worth saving. It's a
+/// snapshot, so a stored copy wins unless that one couldn't be decrypted.
+pub(super) async fn is_bundled_copy_worth_saving(
+    store: &EventCacheStoreLockGuard,
+    room_id: &RoomId,
+    event: &Event,
+) -> Result<bool> {
+    let Some(event_id) = event.event_id() else {
+        return Ok(false);
+    };
+    Ok(match store.find_event(room_id, event_id).await? {
+        None => true,
+        Some(stored) => {
+            matches!(stored.kind, TimelineEventKind::UnableToDecrypt { .. })
+                && !matches!(event.kind, TimelineEventKind::UnableToDecrypt { .. })
+        }
+    })
 }
 
 /// Find a single event, first in-memory, then in-store.

@@ -42,7 +42,10 @@ use super::{
     super::{
         EventCacheError, EventsOrigin, Result,
         deduplicator::{DeduplicationOutcome, filter_duplicate_events},
-        persistence::{find_event, keep_bundled_thread_on_redaction, send_updates_to_store},
+        persistence::{
+            find_event, is_bundled_copy_worth_saving, redact_keeping_thread_summary,
+            send_updates_to_store,
+        },
         states::{
             CacheStateLock, ReloadPreprocessing, StateLock, StateLockWriteGuard,
             selectors::PinnedEventsStateSelector,
@@ -252,8 +255,7 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
             //   under the hood.
             // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this
             //   case.
-            let redacted_event = keep_bundled_thread_on_redaction(target_event_raw, redacted_event);
-            target_event.replace_raw(redacted_event.cast_unchecked());
+            redact_keeping_thread_summary(&mut target_event, redacted_event);
 
             self.replace_event_at(location, target_event.clone()).await?;
         }
@@ -391,7 +393,11 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
             if let Some(mut latest_event) = event.bundled_latest_thread_event() {
                 #[cfg(feature = "e2e-encryption")]
                 redecryptor::try_decrypt_in_place(&mut latest_event, Some(room)).await;
-                self.save_events([latest_event]).await?;
+                if is_bundled_copy_worth_saving(&self.store, &self.state.room_id, &latest_event)
+                    .await?
+                {
+                    self.save_events([latest_event]).await?;
+                }
             }
         }
 
