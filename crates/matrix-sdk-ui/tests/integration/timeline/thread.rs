@@ -331,7 +331,10 @@ async fn test_uncomputed_thread_info_does_not_hide_bundled_thread_summary() {
     let event = f
         .text_msg("thready thread mcthreadface")
         .with_bundled_thread_summary(
-            f.text_msg("the last one!").event_id(latest_event_id).into(),
+            f.text_msg("the last one!")
+                .in_thread(thread_event_id, thread_event_id)
+                .event_id(latest_event_id)
+                .into(),
             42,
             false,
         )
@@ -353,7 +356,25 @@ async fn test_uncomputed_thread_info_does_not_hide_bundled_thread_summary() {
     assert_let!(VectorDiff::PushFront { value } = &timeline_updates[1]);
     assert!(value.is_date_divider());
 
-    assert_pending!(stream);
+    // The thread cache handles the root in the background, so a later sync acts
+    // as a barrier before checking that the summary didn't change.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(f.text_msg("barrier").sender(&BOB)),
+        )
+        .await;
+    assert_let_timeout!(Some(_) = stream.next());
+
+    let items = timeline.items().await;
+    let root = items
+        .iter()
+        .find_map(|item| item.as_event().filter(|event| event.event_id() == Some(thread_event_id)))
+        .unwrap();
+    assert_let!(Some(summary) = root.content().thread_summary());
+    assert_eq!(summary.num_replies, 42);
+    assert_let!(TimelineDetails::Ready(latest_event) = summary.latest_event);
+    assert_eq!(latest_event.content.as_message().unwrap().body(), "the last one!");
 }
 
 #[async_test]
@@ -378,7 +399,10 @@ async fn test_bundled_thread_summary_survives_reload_from_store() {
     let event = f
         .text_msg("thready thread mcthreadface")
         .with_bundled_thread_summary(
-            f.text_msg("the last one!").event_id(latest_event_id).into(),
+            f.text_msg("the last one!")
+                .in_thread(thread_event_id, thread_event_id)
+                .event_id(latest_event_id)
+                .into(),
             42,
             false,
         )

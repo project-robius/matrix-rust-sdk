@@ -20,8 +20,8 @@ use matrix_sdk::{
 use matrix_sdk_test::{ALICE, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{event_id, room_id};
 
-/// A thread's replies aren't counted until one of them shows up, so the thread
-/// root showing up on its own doesn't give the thread a count of zero.
+/// A thread isn't counted until a reply shows up in its own timeline, even
+/// though the latest reply bundled with its root gets saved on its own.
 #[async_test]
 async fn test_thread_info_is_not_counted_before_a_reply_shows_up() {
     let server = MatrixMockServer::new().await;
@@ -32,6 +32,7 @@ async fn test_thread_info_is_not_counted_before_a_reply_shows_up() {
 
     let room_id = room_id!("!r");
     let thread_id = event_id!("$t");
+    let bundled_reply_id = event_id!("$bundled_reply");
     let reply_id = event_id!("$reply");
     let f = EventFactory::new().room(room_id).sender(*ALICE);
 
@@ -39,12 +40,21 @@ async fn test_thread_info_is_not_counted_before_a_reply_shows_up() {
     let (thread, _drop_handles) = event_cache.thread(room_id, thread_id).await.unwrap();
     let (_, mut thread_stream) = thread.subscribe().await.unwrap();
 
-    // The thread root shows up on its own, so there's nothing to count yet.
+    // The thread root shows up with its bundled summary, so there's nothing to
+    // count yet.
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id)
-                .add_timeline_event(f.text_msg("thread root").event_id(thread_id)),
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("thread root").event_id(thread_id).with_bundled_thread_summary(
+                    f.text_msg("bundled reply")
+                        .in_thread(thread_id, thread_id)
+                        .event_id(bundled_reply_id)
+                        .into(),
+                    42,
+                    false,
+                ),
+            ),
         )
         .await;
     assert_let_timeout!(
@@ -65,10 +75,11 @@ async fn test_thread_info_is_not_counted_before_a_reply_shows_up() {
         Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
             thread_stream.recv()
     );
+    // The local count includes the saved bundled reply too.
     assert_let_timeout!(Ok(ThreadEventCacheUpdate::UpdateSummary(summary)) = thread_stream.recv());
-    assert_eq!(summary.num_replies, 1);
+    assert_eq!(summary.num_replies, 2);
     assert_eq!(summary.latest_reply.as_deref(), Some(reply_id));
 
     let thread_info = event_cache.thread_info(room_id, thread_id).await.unwrap().unwrap();
-    assert_eq!(thread_info.number_of_replies, Some(1));
+    assert_eq!(thread_info.number_of_replies, Some(2));
 }

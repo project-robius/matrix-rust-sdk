@@ -23,7 +23,7 @@ use matrix_sdk_base::{
     linked_chunk::{
         ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position, Update, lazy_loader,
     },
-    serde_helpers::extract_redaction_target,
+    serde_helpers::{extract_redaction_target, extract_thread_root},
     sync::Timeline,
 };
 use matrix_sdk_common::executor::spawn;
@@ -553,9 +553,13 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
             .await?
             .len();
 
-        // Having no replies locally doesn't mean the thread has none, so we
-        // keep the count unknown until we've seen at least one.
-        if num_replies == 0 && self.state.thread_info.read().await.number_of_replies.is_none() {
+        // That count includes the root's bundled reply, saved on its own, so
+        // the thread stays uncounted until a reply lands in its own timeline.
+        if self.state.thread_info.read().await.number_of_replies.is_none()
+            && !self.thread_linked_chunk().events().any(|(_position, event)| {
+                extract_thread_root(event.raw()).as_deref() == Some(&*self.thread_id)
+            })
+        {
             return Ok(None);
         }
 
@@ -576,13 +580,16 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
                 .thread_linked_chunk()
                 .revents()
                 .find(|(_position, event)| {
-                    crate::latest_events::filter_timeline_event(
-                        event,
-                        None,
-                        &self.state.own_user_id,
-                        None,
-                    )
-                    .is_break()
+                    // The root sits in the thread's timeline too, but it isn't
+                    // a reply.
+                    event.event_id() != Some(&*self.thread_id)
+                        && crate::latest_events::filter_timeline_event(
+                            event,
+                            None,
+                            &self.state.own_user_id,
+                            None,
+                        )
+                        .is_break()
                 })
                 .and_then(|(_position, event)| event.event_id().map(ToOwned::to_owned));
 

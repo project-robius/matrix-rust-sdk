@@ -1019,7 +1019,10 @@ mod timed_tests {
             .event_id(thread_root_id)
             .with_bundled_edit(f.text_msg("Hello, Kind Sir").sender(*ALICE))
             .with_bundled_thread_summary(
-                f.text_msg("latest reply").event_id(latest_event_id).into(),
+                f.text_msg("latest reply")
+                    .in_thread(thread_root_id, thread_root_id)
+                    .event_id(latest_event_id)
+                    .into(),
                 42,
                 false,
             )
