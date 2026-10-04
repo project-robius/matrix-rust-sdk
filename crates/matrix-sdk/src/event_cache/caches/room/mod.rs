@@ -1072,6 +1072,30 @@ mod timed_tests {
                 latest_event.raw().deserialize().unwrap()
         );
         assert_eq!(msg.as_original().unwrap().content.body(), "latest reply");
+
+        // Redacting the thread root keeps its thread summary too.
+        let timeline = Timeline {
+            limited: false,
+            prev_batch: None,
+            events: vec![f.redaction(thread_root_id).into_event()],
+        };
+        room_event_cache
+            .handle_joined_room_update(
+                timeline,
+                MaybeReceiptEventContent::none(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let stored_root =
+            event_cache_store.find_event(room_id, thread_root_id).await.unwrap().unwrap();
+        assert!(stored_root.raw().deserialize().unwrap().is_redacted());
+        let summary = stored_root.thread_summary().unwrap();
+        assert_eq!(summary.num_replies, 42);
+        assert_eq!(summary.latest_reply.as_deref(), Some(latest_event_id));
     }
 
     #[async_test]

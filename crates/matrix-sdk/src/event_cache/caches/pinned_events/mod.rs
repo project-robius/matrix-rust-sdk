@@ -42,7 +42,7 @@ use super::{
     super::{
         EventCacheError, EventsOrigin, Result,
         deduplicator::{DeduplicationOutcome, filter_duplicate_events},
-        persistence::{find_event, send_updates_to_store},
+        persistence::{find_event, keep_bundled_thread_on_redaction, send_updates_to_store},
         states::{
             CacheStateLock, ReloadPreprocessing, StateLock, StateLockWriteGuard,
             selectors::PinnedEventsStateSelector,
@@ -252,6 +252,7 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
             //   under the hood.
             // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this
             //   case.
+            let redacted_event = keep_bundled_thread_on_redaction(target_event_raw, redacted_event);
             target_event.replace_raw(redacted_event.cast_unchecked());
 
             self.replace_event_at(location, target_event.clone()).await?;

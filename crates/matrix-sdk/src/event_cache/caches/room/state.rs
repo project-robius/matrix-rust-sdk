@@ -47,7 +47,8 @@ use super::{
             deduplicator::{DeduplicationOutcome, filter_duplicate_events},
             persistence::{
                 find_event, find_event_relations, find_event_with_relations,
-                load_linked_chunk_metadata, send_updates_to_store,
+                keep_bundled_thread_on_redaction, load_linked_chunk_metadata,
+                send_updates_to_store,
             },
             states::{ReloadPreprocessing, StateLockReadGuard, StateLockWriteGuard},
         },
@@ -760,6 +761,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             //   under the hood.
             // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this
             //   case.
+            let redacted_event = keep_bundled_thread_on_redaction(target_event_raw, redacted_event);
             target_event.replace_raw(redacted_event.cast_unchecked());
 
             self.replace_event_at(location, target_event.clone()).await?;

@@ -20,7 +20,11 @@ use matrix_sdk_base::{
     executor::spawn,
     linked_chunk::{ChunkMetadata, LinkedChunkId, OwnedLinkedChunkId, Update},
 };
-use ruma::{EventId, RoomId, events::relation::RelationType, serde::Raw};
+use ruma::{
+    EventId, RoomId,
+    events::{AnySyncTimelineEvent, relation::RelationType},
+    serde::Raw,
+};
 use tokio::sync::broadcast::Sender;
 use tracing::trace;
 
@@ -282,6 +286,26 @@ fn strip_relations_if_present<T>(event: &mut Raw<T>) {
         None
     };
     let _ = closure();
+}
+
+/// Copies the bundled thread summary of `original` into its `redacted` form,
+/// since a redacted thread root is still a thread root.
+pub(super) fn keep_bundled_thread_on_redaction(
+    original: &Raw<AnySyncTimelineEvent>,
+    redacted: Raw<AnySyncTimelineEvent>,
+) -> Raw<AnySyncTimelineEvent> {
+    let with_thread = || -> Option<Raw<AnySyncTimelineEvent>> {
+        let unsigned = original.get_field::<serde_json::Value>("unsigned").ok()??;
+        let thread = unsigned.get("m.relations")?.get("m.thread")?;
+        let mut val: serde_json::Value = redacted.deserialize_as().ok()?;
+        val.as_object_mut()?
+            .entry("unsigned")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()))
+            .as_object_mut()?
+            .insert("m.relations".to_owned(), serde_json::json!({ "m.thread": thread }));
+        Raw::new(&val).ok().map(Raw::cast_unchecked)
+    };
+    with_thread().unwrap_or(redacted)
 }
 
 /// Find a single event, first in-memory, then in-store.
