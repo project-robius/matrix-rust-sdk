@@ -15,17 +15,19 @@
 use std::collections::{BTreeMap, HashMap};
 
 use matrix_sdk_base::{
+    deserialized_responses::TimelineEvent,
     serde_helpers::{extract_redaction_target, extract_relation, extract_thread_root},
     sync::Timeline,
 };
 use ruma::{
-    OwnedEventId,
+    EventId, OwnedEventId,
     events::{
-        AnySyncEphemeralRoomEvent,
+        AnySyncEphemeralRoomEvent, AnySyncTimelineEvent,
         receipt::{ReceiptEventContent, ReceiptThread, Receipts},
         relation::RelationType,
     },
     room_version_rules::RedactionRules,
+    serde::Raw,
 };
 
 use super::{
@@ -94,29 +96,10 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
                 | RelationType::Replacement
                 | RelationType::Reference
                 | _ => {
-                    // First, look for the related event in `timeline`
-                    // backwards.
-                    if let Some(thread_root) = match timeline.events[..nth]
-                        .iter()
-                        .rev()
-                        .find(|event| event.event_id() == Some(&related_event_id))
+                    if let Some(thread_root) =
+                        find_thread_root(&related_event_id, &timeline.events[..nth], &maybe_room)
+                            .await?
                     {
-                        // The related event has been found in the `timeline`!
-                        // Extract its thread root.
-                        Some(related_event) => extract_thread_root(related_event.raw()),
-
-                        // Not in `timeline`, okay, look for the related event
-                        // in the `room` as it knows about all the events, and
-                        // then extract its thread root.
-                        None => match &maybe_room {
-                            Some(room) => room.find_event(&related_event_id).await?.and_then(
-                                |(_location, related_event)| {
-                                    extract_thread_root(related_event.raw())
-                                },
-                            ),
-                            None => None,
-                        },
-                    } {
                         new_events_by_thread
                             .entry(thread_root)
                             .or_insert_with(default_entry)
@@ -145,32 +128,17 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
                 // Otherwise, this event might be a redaction that applies to a thread.
                 else if let Some(redaction_target) =
                     extract_redaction_target(event.raw(), redaction_rules)
-                    && match &maybe_room {
-                        Some(room) => room.find_event(&redaction_target).await?.is_some(),
-                        None => false,
-                    }
                 {
-                    // The redacted event exists (in the room, because it
-                    // contains _all_ the events) **but** the event has been
-                    // redacted (in the room). It's no more possible to extract
-                    // its thread root (because this information has been
-                    // removed).
-                    //
-                    // But we need to know if the event is part of a thread to
-                    // apply the redaction in the thread too. No other choice
-                    // than doing a full search…
+                    // A redacted thread root is part of its own thread. Other
+                    // targets are found before the room redacts them.
+                    let thread_root = if existing_threads.contains_key(&redaction_target) {
+                        Some(redaction_target)
+                    } else {
+                        find_thread_root(&redaction_target, &timeline.events[..nth], &maybe_room)
+                            .await?
+                    };
 
-                    let mut associated_thread_root = None;
-
-                    for thread in existing_threads.values() {
-                        if thread.has_event_in_own_timeline(&redaction_target).await? {
-                            associated_thread_root = Some(thread.thread_id.clone());
-                            break;
-                        }
-                    }
-
-                    // We've found the thread owning the event being redacted!
-                    if let Some(thread_root) = associated_thread_root {
+                    if let Some(thread_root) = thread_root {
                         new_events_by_thread
                             .entry(thread_root)
                             .or_insert_with(default_entry)
@@ -202,6 +170,49 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
     }
 
     Ok(new_events_by_thread)
+}
+
+/// Finds the thread that an event is part of, looking at this sync's
+/// `earlier_events` first, then the room. Reactions and edits are part of the
+/// thread of the event they relate to.
+async fn find_thread_root(
+    event_id: &EventId,
+    earlier_events: &[TimelineEvent],
+    maybe_room: &Option<StateLockReadGuard<'_, RoomEventCacheState>>,
+) -> Result<Option<OwnedEventId>> {
+    let Some(event) = find_raw_event(event_id, earlier_events, maybe_room).await? else {
+        return Ok(None);
+    };
+
+    if let Some(thread_root) = extract_thread_root(&event) {
+        return Ok(Some(thread_root));
+    }
+
+    let Some((_relation_type, related_event_id)) = extract_relation(&event) else {
+        return Ok(None);
+    };
+
+    Ok(find_raw_event(&related_event_id, earlier_events, maybe_room)
+        .await?
+        .and_then(|related_event| extract_thread_root(&related_event)))
+}
+
+/// Looks for an event in this sync's `earlier_events`, then in the room.
+async fn find_raw_event(
+    event_id: &EventId,
+    earlier_events: &[TimelineEvent],
+    maybe_room: &Option<StateLockReadGuard<'_, RoomEventCacheState>>,
+) -> Result<Option<Raw<AnySyncTimelineEvent>>> {
+    if let Some(event) =
+        earlier_events.iter().rev().find(|event| event.event_id() == Some(event_id))
+    {
+        return Ok(Some(event.raw().clone()));
+    }
+
+    Ok(match maybe_room {
+        Some(room) => room.find_event(event_id).await?.map(|(_location, event)| event.into_raw()),
+        None => None,
+    })
 }
 
 pub fn aggregate_timeline_for_pinned_events(

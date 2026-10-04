@@ -319,6 +319,29 @@ impl Caches {
             .filter_map(|ephemeral_event| ephemeral_event.deserialize().ok())
             .collect::<Vec<_>>();
 
+        // Threads are aggregated before the room handles this sync, while a
+        // redaction's target still says which thread it's part of.
+        let timeline_and_read_receipts_for_threads = {
+            // To aggregate the timelines for threads, we need to lookup in
+            // the room cache and the thread caches. We acquire a read lock
+            // over all the caches, and select the room cache and thread
+            // cache' states.
+            let all_states_lock = states::CacheStateLock::new(
+                states::selectors::AllStatesSelector::new(room.room_id().to_owned()),
+                self.internals.state.clone(),
+            );
+            let all_states = all_states_lock.read().await?;
+
+            aggregator::aggregate_timeline_and_read_receipts_for_threads(
+                &original_timeline,
+                &original_ephemeral,
+                all_states.threads(),
+                all_states.room(),
+                &internals.room_version_rules.redaction,
+            )
+            .await?
+        };
+
         // Room.
         {
             let (timeline, read_receipts) =
@@ -339,27 +362,6 @@ impl Caches {
 
         // Threads.
         {
-            let timeline_and_read_receipts_for_threads = {
-                // To aggregate the timelines for threads, we need to lookup in
-                // the room cache and the thread caches. We acquire a read lock
-                // over all the caches, and select the room cache and thread
-                // cache' states.
-                let all_states_lock = states::CacheStateLock::new(
-                    states::selectors::AllStatesSelector::new(room.room_id().to_owned()),
-                    self.internals.state.clone(),
-                );
-                let all_states = all_states_lock.read().await?;
-
-                aggregator::aggregate_timeline_and_read_receipts_for_threads(
-                    &original_timeline,
-                    &original_ephemeral,
-                    all_states.threads(),
-                    all_states.room(),
-                    &internals.room_version_rules.redaction,
-                )
-                .await?
-            };
-
             for (thread_id, (timeline, read_receipts)) in timeline_and_read_receipts_for_threads {
                 // Update the thread summary if and only if there are new
                 // events.
@@ -417,6 +419,29 @@ impl Caches {
             ambiguity_changes,
         } = updates;
 
+        // Threads are aggregated before the room handles this sync, while a
+        // redaction's target still says which thread it's part of.
+        let timeline_and_read_receipts_for_threads = {
+            // To aggregate the timelines for threads, we need to lookup in
+            // the room cache and the thread caches. We acquire a read lock
+            // over all the caches, and select the room cache and thread
+            // cache' states.
+            let all_caches_states_lock = states::CacheStateLock::new(
+                states::selectors::AllStatesSelector::new(room.room_id().to_owned()),
+                self.internals.state.clone(),
+            );
+            let all_caches_states = all_caches_states_lock.read().await?;
+
+            aggregator::aggregate_timeline_and_read_receipts_for_threads(
+                &original_timeline,
+                &[],
+                all_caches_states.threads(),
+                all_caches_states.room(),
+                &internals.room_version_rules.redaction,
+            )
+            .await?
+        };
+
         // Room.
         {
             let (timeline, _read_receipts) =
@@ -427,27 +452,6 @@ impl Caches {
 
         // Threads.
         {
-            let timeline_and_read_receipts_for_threads = {
-                // To aggregate the timelines for threads, we need to lookup in
-                // the room cache and the thread caches. We acquire a read lock
-                // over all the caches, and select the room cache and thread
-                // cache' states.
-                let all_caches_states_lock = states::CacheStateLock::new(
-                    states::selectors::AllStatesSelector::new(room.room_id().to_owned()),
-                    self.internals.state.clone(),
-                );
-                let all_caches_states = all_caches_states_lock.read().await?;
-
-                aggregator::aggregate_timeline_and_read_receipts_for_threads(
-                    &original_timeline,
-                    &[],
-                    all_caches_states.threads(),
-                    all_caches_states.room(),
-                    &internals.room_version_rules.redaction,
-                )
-                .await?
-            };
-
             for (thread_id, (timeline, _read_receipts)) in timeline_and_read_receipts_for_threads {
                 let thread = self.thread(thread_id).await?;
                 thread.handle_left_room_update(timeline).await?;

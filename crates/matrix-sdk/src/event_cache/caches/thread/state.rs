@@ -314,21 +314,6 @@ impl<'a> StateLockReadGuard<'a, ThreadEventCacheState> {
         find_event(event_id, &self.room_id, &self.thread_linked_chunk, &self.store).await
     }
 
-    /// Whether the event is in this thread's own timeline, in memory or in the
-    /// store, unlike `find_event` which looks it up in the whole room.
-    pub(in super::super) async fn has_event_in_own_timeline(
-        &self,
-        event_id: &EventId,
-    ) -> Result<bool> {
-        if self.thread_linked_chunk.events().any(|(_, event)| event.event_id() == Some(event_id)) {
-            return Ok(true);
-        }
-        let linked_chunk_id = LinkedChunkId::Thread(&self.room_id, &self.thread_id);
-        let found =
-            self.store.filter_duplicated_events(linked_chunk_id, vec![event_id.to_owned()]).await?;
-        Ok(!found.is_empty())
-    }
-
     /// See documentation of [`find_event_with_relations`].
     pub async fn find_event_with_relations(
         &self,

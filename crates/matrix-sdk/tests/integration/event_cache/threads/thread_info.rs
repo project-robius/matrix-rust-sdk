@@ -12,11 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use matrix_sdk::{
     assert_let_timeout,
-    event_cache::{ThreadEventCacheUpdate, TimelineVectorDiffs},
+    event_cache::{RoomEventCacheUpdate, ThreadEventCacheUpdate, TimelineVectorDiffs},
+    linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
+    store::StoreConfig,
     test_utils::mocks::MatrixMockServer,
 };
+use matrix_sdk_base::event_cache::{
+    store::{EventCacheStore, MemoryStore},
+    thread::ThreadInfo,
+};
+use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk_test::{ALICE, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{
     EventId, event_id,
@@ -209,8 +218,8 @@ async fn test_redacted_thread_root_keeps_its_summary() {
     assert_eq!(summary.latest_reply.as_deref(), Some(latest_reply_id));
 }
 
-/// A redaction goes to the thread whose own timeline holds its target, even
-/// when other threads are loaded too.
+/// A redaction goes to its target's thread, even when other threads are loaded
+/// too.
 #[async_test]
 async fn test_redaction_goes_to_its_own_thread() {
     let server = MatrixMockServer::new().await;
@@ -271,4 +280,176 @@ async fn test_redaction_goes_to_its_own_thread() {
     for (_, _, stream) in &threads[..5] {
         assert!(stream.is_empty());
     }
+}
+
+/// A reply and its redaction in the same sync leave the reply redacted, even
+/// with its thread loaded.
+#[async_test]
+async fn test_reply_and_its_redaction_in_one_sync() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    let room_id = room_id!("!r");
+    let thread_id = event_id!("$t");
+    let reply_id = event_id!("$reply");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+
+    server.sync_joined_room(&client, room_id).await;
+    let (thread, _drop_handles) = event_cache.thread(room_id, thread_id).await.unwrap();
+    let (_, mut thread_stream) = thread.subscribe().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("secret").in_thread(thread_id, thread_id).event_id(reply_id),
+                )
+                .add_timeline_event(f.redaction(reply_id)),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+
+    let store = client.event_cache_store().lock().await.unwrap();
+    let stored_reply =
+        store.as_clean().unwrap().find_event(room_id, reply_id).await.unwrap().unwrap();
+    assert!(stored_reply.raw().deserialize().unwrap().is_redacted());
+}
+
+/// A redaction recounts its reply's thread even when that thread isn't loaded,
+/// e.g. after a restart.
+#[async_test]
+async fn test_redaction_reaches_a_thread_that_is_not_loaded() {
+    let room_id = room_id!("!r");
+    let thread_id = event_id!("$t");
+    let reply_id = event_id!("$reply");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+
+    // An earlier session stored the room with a counted thread, whose reply it
+    // only saw in the room's timeline.
+    let event_cache_store = Arc::new(MemoryStore::new());
+    let chunk_id = ChunkIdentifier::new(0);
+    event_cache_store
+        .handle_linked_chunk_updates(
+            LinkedChunkId::Room(room_id),
+            vec![
+                Update::NewItemsChunk { previous: None, new: chunk_id, next: None },
+                Update::PushItems {
+                    at: Position::new(chunk_id, 0),
+                    items: vec![
+                        f.text_msg("thread root").event_id(thread_id).into_event(),
+                        f.text_msg("reply")
+                            .in_thread(thread_id, thread_id)
+                            .event_id(reply_id)
+                            .into_event(),
+                    ],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let thread_info = ThreadInfo {
+        number_of_replies: Some(1),
+        latest_event: Some(reply_id.to_owned()),
+        ..ThreadInfo::new()
+    };
+    event_cache_store.load_thread_info(room_id, thread_id, true).await.unwrap();
+    event_cache_store.update_thread_info(room_id, thread_id, &thread_info).await.unwrap();
+
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::multi_process("hodor"))
+                    .event_cache_store(event_cache_store.clone()),
+            )
+        })
+        .build()
+        .await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    server.sync_joined_room(&client, room_id).await;
+    let (room_event_cache, _drop_handles) = event_cache.room(room_id).await.unwrap();
+    let (_, mut room_stream) = room_event_cache.subscribe().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(f.redaction(reply_id)),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            room_stream.recv()
+    );
+    assert_let_timeout!(
+        Ok(RoomEventCacheUpdate::UpdateThreadSummary { thread_root, thread_summary }) =
+            room_stream.recv()
+    );
+    assert_eq!(thread_root, thread_id);
+    assert_eq!(thread_summary.num_replies, 0);
+
+    let thread_info = event_cache.thread_info(room_id, thread_id).await.unwrap().unwrap();
+    assert_eq!(thread_info.number_of_replies, Some(0));
+    assert!(thread_info.latest_event.is_none());
+}
+
+/// Redacting a reaction to a reply reaches the reply's thread.
+#[async_test]
+async fn test_reaction_redaction_goes_to_its_thread() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    let room_id = room_id!("!r");
+    let thread_id = event_id!("$t");
+    let reply_id = event_id!("$reply");
+    let reaction_id = event_id!("$reaction");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+
+    server.sync_joined_room(&client, room_id).await;
+    let (thread, _drop_handles) = event_cache.thread(room_id, thread_id).await.unwrap();
+    let (_, mut thread_stream) = thread.subscribe().await.unwrap();
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("reply").in_thread(thread_id, thread_id).event_id(reply_id),
+                )
+                .add_timeline_event(f.reaction(reply_id, "👍").event_id(reaction_id)),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+    assert_let_timeout!(Ok(ThreadEventCacheUpdate::UpdateSummary(_)) = thread_stream.recv());
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(f.redaction(reaction_id)),
+        )
+        .await;
+    assert_let_timeout!(
+        Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            thread_stream.recv()
+    );
+
+    let (events, _) = thread.subscribe().await.unwrap();
+    let reaction = events.iter().find(|event| event.event_id() == Some(reaction_id)).unwrap();
+    assert!(reaction.raw().deserialize().unwrap().is_redacted());
 }
