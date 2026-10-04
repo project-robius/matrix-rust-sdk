@@ -20,7 +20,7 @@ use matrix_sdk_base::{
     event_cache::{Event, Gap},
     linked_chunk::{ChunkContent, LinkedChunkId, Update},
 };
-use ruma::api::Direction;
+use ruma::{EventId, api::Direction};
 use tracing::{error, trace};
 
 use super::{
@@ -29,6 +29,7 @@ use super::{
             EventCacheError, EventsOrigin, Result, TimelineVectorDiffs,
             deduplicator::{DeduplicationOutcome, filter_duplicate_events},
         },
+        event_linked_chunk::EventLinkedChunk,
         pagination::{
             BackPaginationOutcome, LoadMoreEventsBackwardsOutcome, PaginatedCache, Pagination,
             SharedPaginationStatus,
@@ -102,6 +103,12 @@ impl PaginatedCache for ThreadEventCacheWrapper {
     async fn load_more_events_backwards(&self) -> Result<LoadMoreEventsBackwardsOutcome> {
         let mut state = self.cache.state.write().await?;
 
+        if has_thread_start(state.thread_linked_chunk(), &self.cache.thread_id) {
+            trace!("thread root is loaded with no gap after it: reached_start=true");
+
+            return Ok(LoadMoreEventsBackwardsOutcome::StartOfTimeline);
+        }
+
         // If any in-memory chunk is a gap, don't load more events, and let the
         // caller resolve the gap.
         if let Some(prev_token) = state.thread_linked_chunk().rgap().map(|gap| gap.token) {
@@ -130,20 +137,8 @@ impl PaginatedCache for ThreadEventCacheWrapper {
             }
 
             Ok(None) => {
-                // No previous chunk in the store.
-                //
-                // If the first in-memory event is the thread root, it's all
-                // good, we have effectively reached the start of the thread.
-                if let Some((_pos, first_event)) = state.thread_linked_chunk().events().next()
-                    && self.cache.thread_id
-                        == first_event.event_id().expect("Stored events all have an ID")
-                {
-                    trace!("thread chunk is fully loaded and non-empty: reached_start=true");
-
-                    return Ok(LoadMoreEventsBackwardsOutcome::StartOfTimeline);
-                }
-
-                // Otherwise, start back-pagination from the end of the thread.
+                // No previous chunk in the store, so start back-pagination from
+                // the end of the thread.
                 return Ok(LoadMoreEventsBackwardsOutcome::Gap {
                     prev_token: None,
                     waited_for_initial_prev_token: state.waited_for_initial_prev_token(),
@@ -171,7 +166,7 @@ impl PaginatedCache for ThreadEventCacheWrapper {
         //
         // This value is correct, if and only if, it is used for a chunk content
         // of kind `Items`.
-        let reached_start = new_first_chunk.previous.is_none();
+        let reached_start_on_disk = new_first_chunk.previous.is_none();
 
         if let Err(err) = state.thread_linked_chunk_mut().insert_new_chunk_as_first(new_first_chunk)
         {
@@ -208,6 +203,9 @@ impl PaginatedCache for ThreadEventCacheWrapper {
             }
 
             ChunkContent::Items(events) => {
+                let reached_start = reached_start_on_disk
+                    || has_thread_start(state.thread_linked_chunk(), &self.cache.thread_id);
+
                 trace!(?reached_start, "reloaded chunk from disk ({} items)", events.len());
 
                 LoadMoreEventsBackwardsOutcome::Events {
@@ -384,6 +382,8 @@ impl PaginatedCache for ThreadEventCacheWrapper {
             new_gap,
             &topo_ordered_events,
         );
+        let reached_start =
+            reached_start || has_thread_start(state.thread_linked_chunk(), &self.cache.thread_id);
 
         // Update the store.
         state.state.propagate_changes(&state.store).await?;
@@ -415,6 +415,23 @@ impl PaginatedCache for ThreadEventCacheWrapper {
 
         Ok(Some(BackPaginationOutcome { reached_start, events }))
     }
+}
+
+/// Is the thread root in memory with no gap after it? Nothing in a thread is
+/// older than its root, so the chunks and gaps before it can't add anything.
+fn has_thread_start(linked_chunk: &EventLinkedChunk, thread_id: &EventId) -> bool {
+    for chunk in linked_chunk.rchunks() {
+        match chunk.content() {
+            ChunkContent::Gap(_) => return false,
+            ChunkContent::Items(events) => {
+                if events.iter().any(|event| event.event_id() == Some(thread_id)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 impl fmt::Debug for ThreadPagination {

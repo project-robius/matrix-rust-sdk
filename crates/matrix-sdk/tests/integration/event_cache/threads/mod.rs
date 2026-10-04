@@ -9,12 +9,14 @@ use matrix_sdk::{
     Client, ThreadingSupport, assert_let_timeout,
     deserialized_responses::TimelineEvent,
     event_cache::{RoomEventCacheUpdate, Subscriber, ThreadEventCacheUpdate, TimelineVectorDiffs},
+    linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     sleep::sleep,
     test_utils::{
         assert_event_matches_msg,
         mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
     },
 };
+use matrix_sdk_base::event_cache::Gap;
 use matrix_sdk_test::{ALICE, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{
     OwnedEventId, OwnedRoomId, event_id,
@@ -335,6 +337,212 @@ async fn test_deduplication() {
 
     // The events were already known, so the stream is still empty.
     assert!(thread_stream.is_empty());
+}
+
+#[async_test]
+async fn test_thread_pagination_stops_at_the_root() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    let room_id = room_id!("!galette:saucisse.bzh");
+    server.sync_joined_room(&client, room_id).await;
+
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+    let thread_root = event_id!("$thread_root");
+    let replies = [event_id!("$reply0"), event_id!("$reply1"), event_id!("$reply2")];
+    let reply =
+        |event_id| f.text_msg("reply").in_thread(thread_root, thread_root).event_id(event_id);
+
+    let (thread_event_cache, _drop_handles) =
+        event_cache.thread(room_id, thread_root).await.unwrap();
+    let (_, mut thread_stream) = thread_event_cache.subscribe().await.unwrap();
+
+    // Each sync appends a gap and one reply, fragmenting the thread.
+    for (index, reply_id) in replies.into_iter().enumerate() {
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_event(reply(reply_id))
+                    .set_timeline_prev_batch(format!("prev_batch_{index}")),
+            )
+            .await;
+
+        assert_let_timeout!(
+            Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(_)) = thread_stream.recv()
+        );
+        assert_let_timeout!(Ok(ThreadEventCacheUpdate::UpdateSummary(_)) = thread_stream.recv());
+    }
+
+    // The newest gap's page goes all the way back to the root.
+    server
+        .mock_room_relations()
+        .match_target_event(thread_root.to_owned())
+        .match_from("prev_batch_2")
+        .ok(RoomRelationsResponseTemplate::default()
+            .events(vec![reply(replies[1]), reply(replies[0])]))
+        .mock_once()
+        .mount()
+        .await;
+    server
+        .mock_room_event()
+        .match_event_id()
+        .ok(f.text_msg("Thread root").event_id(thread_root).into())
+        .mock_once()
+        .mount()
+        .await;
+
+    // The older gaps end up before the root, so they can't hide any reply.
+    for prev_batch in ["prev_batch_0", "prev_batch_1"] {
+        server
+            .mock_room_relations()
+            .match_target_event(thread_root.to_owned())
+            .match_from(prev_batch)
+            .ok(RoomRelationsResponseTemplate::default())
+            .never()
+            .mount()
+            .await;
+    }
+
+    let outcome = thread_event_cache.pagination().run_backwards_once(42).await.unwrap();
+    assert!(outcome.reached_start);
+
+    let (events, _) = thread_event_cache.subscribe().await.unwrap();
+    let event_ids = events.iter().map(|event| event.event_id().unwrap()).collect::<Vec<_>>();
+    assert_eq!(event_ids, [thread_root, replies[0], replies[1], replies[2]]);
+
+    let outcome = thread_event_cache.pagination().run_backwards_once(42).await.unwrap();
+    assert!(outcome.reached_start);
+    assert!(outcome.events.is_empty());
+}
+
+#[async_test]
+async fn test_thread_pagination_fills_a_gap_after_the_root() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+
+    let room_id = room_id!("!galette:saucisse.bzh");
+    server.sync_joined_room(&client, room_id).await;
+
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+    let thread_root = event_id!("$thread_root");
+    let replies = [event_id!("$reply0"), event_id!("$reply1"), event_id!("$reply2")];
+    let reply =
+        |event_id| f.text_msg("reply").in_thread(thread_root, thread_root).event_id(event_id);
+
+    // Creating the thread's cache first lets the synced root land in it.
+    let (thread_event_cache, _drop_handles) =
+        event_cache.thread(room_id, thread_root).await.unwrap();
+    let (_, mut thread_stream) = thread_event_cache.subscribe().await.unwrap();
+
+    // The second reply is missed, leaving a gap after the first one.
+    let syncs = [
+        JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(f.text_msg("Thread root").event_id(thread_root))
+            .add_timeline_event(reply(replies[0]))
+            .set_timeline_prev_batch("prev_batch_0"),
+        JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(reply(replies[2]))
+            .set_timeline_prev_batch("prev_batch_2"),
+    ];
+    for sync in syncs {
+        server.sync_room(&client, sync).await;
+
+        assert_let_timeout!(
+            Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(_)) = thread_stream.recv()
+        );
+        assert_let_timeout!(Ok(ThreadEventCacheUpdate::UpdateSummary(_)) = thread_stream.recv());
+    }
+
+    server
+        .mock_room_relations()
+        .match_target_event(thread_root.to_owned())
+        .match_from("prev_batch_2")
+        .ok(RoomRelationsResponseTemplate::default()
+            .events(vec![reply(replies[1]), reply(replies[0])]))
+        .mock_once()
+        .mount()
+        .await;
+
+    let outcome = thread_event_cache.pagination().run_backwards_once(42).await.unwrap();
+    assert!(outcome.reached_start);
+
+    let (events, _) = thread_event_cache.subscribe().await.unwrap();
+    let event_ids = events.iter().map(|event| event.event_id().unwrap()).collect::<Vec<_>>();
+    assert_eq!(event_ids, [thread_root, replies[0], replies[1], replies[2]]);
+}
+
+#[async_test]
+async fn test_thread_pagination_stops_at_a_stored_root() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+
+    let room_id = room_id!("!galette:saucisse.bzh");
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+    let thread_root = event_id!("$thread_root");
+    let replies = [event_id!("$reply0"), event_id!("$reply1")];
+    let reply = |event_id| {
+        f.text_msg("reply").in_thread(thread_root, thread_root).event_id(event_id).into_event()
+    };
+
+    // An earlier session stored the thread with a leftover gap before its root.
+    let (gap_chunk, root_chunk, last_chunk) =
+        (ChunkIdentifier::new(0), ChunkIdentifier::new(1), ChunkIdentifier::new(2));
+    client
+        .event_cache_store()
+        .lock()
+        .await
+        .unwrap()
+        .as_clean()
+        .unwrap()
+        .handle_linked_chunk_updates(
+            LinkedChunkId::Thread(room_id, thread_root),
+            vec![
+                Update::NewGapChunk {
+                    previous: None,
+                    new: gap_chunk,
+                    next: None,
+                    gap: Gap { token: "prev_batch".to_owned() },
+                },
+                Update::NewItemsChunk { previous: Some(gap_chunk), new: root_chunk, next: None },
+                Update::PushItems {
+                    at: Position::new(root_chunk, 0),
+                    items: vec![
+                        f.text_msg("Thread root").event_id(thread_root).into_event(),
+                        reply(replies[0]),
+                    ],
+                },
+                Update::NewItemsChunk { previous: Some(root_chunk), new: last_chunk, next: None },
+                Update::PushItems {
+                    at: Position::new(last_chunk, 0),
+                    items: vec![reply(replies[1])],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let event_cache = client.event_cache();
+    event_cache.subscribe().unwrap();
+    server.sync_joined_room(&client, room_id).await;
+
+    let (thread_event_cache, _drop_handles) =
+        event_cache.thread(room_id, thread_root).await.unwrap();
+    let (events, _thread_stream) = thread_event_cache.subscribe().await.unwrap();
+    assert_eq!(events.len(), 1);
+
+    let outcome = thread_event_cache.pagination().run_backwards_once(42).await.unwrap();
+    assert!(outcome.reached_start);
+
+    let (events, _) = thread_event_cache.subscribe().await.unwrap();
+    let event_ids = events.iter().map(|event| event.event_id().unwrap()).collect::<Vec<_>>();
+    assert_eq!(event_ids, [thread_root, replies[0], replies[1]]);
 }
 
 struct ThreadSubscriptionTestSetup {
