@@ -224,6 +224,18 @@ pub struct ObservableItemsTransaction<'observable_items> {
 }
 
 impl<'observable_items> ObservableItemsTransaction<'observable_items> {
+    /// Record a [`Clear`](eyeball_im::VectorDiff::Clear) and
+    /// [`Append`](eyeball_im::VectorDiff::Append) of the final items in this
+    /// transaction, without changing the remote-event index mapping.
+    ///
+    /// Committing publishes a real reset even when local echoes survive it. The
+    /// final items are unchanged, and earlier removal diffs are replaced.
+    pub(super) fn reset_items_to_current(&mut self) {
+        let values = self.items.iter().cloned().collect();
+        self.items.clear();
+        self.items.append(values);
+    }
+
     /// Get a reference to the timeline item at position `timeline_item_index`.
     pub fn get(&self, timeline_item_index: usize) -> Option<&Arc<TimelineItem>> {
         self.items.get(timeline_item_index)

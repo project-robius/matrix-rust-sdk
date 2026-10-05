@@ -19,16 +19,140 @@ use futures_util::{StreamExt as _, pin_mut};
 use matrix_sdk::event_cache::{PaginationStatus, RoomPagination};
 use tracing::instrument;
 
-use super::Error;
+use std::sync::Arc;
+
+use eyeball_im::VectorDiff;
+use imbl::Vector;
+
+use super::{Error, TimelineItem, subscriber::{TimelineSubscriber, TimelineWithDropHandle}};
 use crate::timeline::{PaginationError::NotSupported, controller::TimelineFocusKind};
+
+/// Which end of the timeline a pagination call should extend.
+#[derive(Clone, Copy)]
+enum PaginationDirection {
+    /// Add older events at the start of the timeline.
+    Backwards,
+    /// Add newer events at the end of an event-focused timeline.
+    Forwards
+}
 
 impl super::Timeline {
     /// Add more events to the start of the timeline.
     ///
-    /// Returns whether we hit the start of the timeline.
+    /// Returns whether we hit the start of the timeline. On success, the cache
+    /// updates have been applied internally, even for empty or filtered pages.
+    /// This does not mean an existing item subscriber has consumed its queued
+    /// diffs; use [`Self::paginate_backwards_with_subscription`] when needed.
+    ///
+    /// A clear or replacement during pagination returns `false` rather than
+    /// confirming an old start of history. A later call can confirm the new start.
     #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
-    pub async fn paginate_backwards(&self, mut num_events: u16) -> Result<bool, Error> {
-        match self.controller.focus() {
+    pub async fn paginate_backwards(&self, num_events: u16) -> Result<bool, Error> {
+        self.paginate(PaginationDirection::Backwards, num_events, false).await.0
+    }
+
+    /// Add more events to the end of the timeline.
+    ///
+    /// Returns whether we hit the end of the timeline, with the same delivery
+    /// guarantees as [`Self::paginate_backwards`].
+    #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
+    pub async fn paginate_forwards(&self, num_events: u16) -> Result<bool, Error> {
+        self.paginate(PaginationDirection::Forwards, num_events, false).await.0
+    }
+
+    /// Add older events and return the result, current visible items, and a
+    /// fresh item stream, in that order.
+    ///
+    /// The result, items, and new subscription are captured under one timeline
+    /// lock after waiting for cache processing. The items use the same
+    /// filtering and lazy pagination limits as [`Self::subscribe`], and may also
+    /// include concurrent sync changes. The stream starts after that snapshot.
+    /// Install the returned items, switch to the new stream, and discard queued
+    /// diffs from any previous subscription.
+    ///
+    /// `Ok(true)` confirms the start of this timeline. A clear or replacement
+    /// during pagination instead returns `Ok(false)`; another call can confirm
+    /// the new start of history. Pinned timelines do not support backwards pagination.
+    ///
+    /// An `Err` still comes with the items already applied and a usable stream,
+    /// including partial changes made before the error. If a cache-processing
+    /// task stopped, some page changes may not have been applied. Like
+    /// [`Self::subscribe`], the returned stream keeps timeline background tasks alive.
+    ///
+    /// Dropping this future before it returns cancels the remaining delivery
+    /// wait and snapshot capture. Changes already applied stay in the timeline,
+    /// and an underlying shared cache request may keep running.
+    pub async fn paginate_backwards_with_subscription(
+        &self,
+        num_events: u16,
+    ) -> (Result<bool, Error>, Vector<Arc<TimelineItem>>,
+        impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>> + use<>)
+    {
+        self.paginate_with_subscription(PaginationDirection::Backwards, num_events).await
+    }
+
+    /// Add newer events and return the result, current visible items, and a
+    /// fresh item stream, in that order.
+    ///
+    /// The snapshot, stream, errors, and cancellation behave as described in
+    /// [`Self::paginate_backwards_with_subscription`]. Here, `Ok(true)` confirms
+    /// the end of the timeline. Event-focused timelines can fetch newer events;
+    /// live timelines are already at the end. Thread and pinned timelines do not
+    /// support forwards pagination.
+    pub async fn paginate_forwards_with_subscription(
+        &self,
+        num_events: u16,
+    ) -> (Result<bool, Error>, Vector<Arc<TimelineItem>>,
+        impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>> + use<>)
+    {
+        self.paginate_with_subscription(PaginationDirection::Forwards, num_events).await
+    }
+
+    /// Run pagination with a snapshot and wrap its stream to keep the timeline's
+    /// background tasks alive, just as [`Self::subscribe`] does.
+    async fn paginate_with_subscription(
+        &self,
+        direction: PaginationDirection,
+        num_events: u16,
+    ) -> (Result<bool, Error>, Vector<Arc<TimelineItem>>,
+        impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>> + use<>)
+    {
+        let (result, subscription) = self.paginate(direction, num_events, true).await;
+        let (items, stream) = subscription.expect("pagination requested a subscription");
+        (result, items, TimelineWithDropHandle::new(stream, self.drop_handle.clone()))
+    }
+
+    /// Run a page, wait for cache processing, and check for a reset.
+    ///
+    /// `subscribe` requests current visible items and a fresh stream too. Both
+    /// cache tasks are awaited even after an error; the pagination error takes
+    /// precedence if cache processing also fails. Cancelling this future skips
+    /// the remaining wait and final snapshot, not changes already applied.
+    async fn paginate(
+        &self,
+        direction: PaginationDirection,
+        num_events: u16,
+        subscribe: bool,
+    ) -> (Result<bool, Error>, Option<(Vector<Arc<TimelineItem>>, TimelineSubscriber)>) {
+        let generation = self.controller.pagination_generation().await;
+        let result = match direction {
+            PaginationDirection::Backwards => self.backwards(num_events).await,
+            PaginationDirection::Forwards => self.forwards(num_events).await,
+        };
+        // A failure can follow lazy expansion or partially applied events too.
+        // Wait for both independent cache tasks even if either fence fails.
+        let delivered = self.wait_for_cache_updates().await;
+        let result = result.and_then(|reached_end| delivered.map(|()| reached_end));
+        self.controller.finish_pagination(result, generation,
+            matches!(direction, PaginationDirection::Backwards), subscribe).await
+    }
+
+    /// Do backwards pagination before waiting for the cache tasks.
+    ///
+    /// Live timelines reveal cached items first; event and thread timelines use
+    /// their own caches. The result still needs to be checked for a reset.
+    async fn backwards(&self, mut num_events: u16) -> Result<bool, Error> {
+        let fully_paginated = match self.controller.focus() {
             TimelineFocusKind::Live { event_cache, .. } => {
                 match self.controller.live_lazy_paginate_backwards(num_events).await {
                     Some(needed_num_events) => {
@@ -62,15 +186,16 @@ impl super::Timeline {
                 .map(|outcome| outcome.reached_start)?),
 
             TimelineFocusKind::PinnedEvents { .. } => Err(Error::PaginationError(NotSupported)),
-        }
+        }?;
+        Ok(fully_paginated)
     }
 
-    /// Add more events to the end of the timeline.
+    /// Do forwards pagination before waiting for the cache tasks.
     ///
-    /// Returns whether we hit the end of the timeline.
-    #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
-    pub async fn paginate_forwards(&self, num_events: u16) -> Result<bool, Error> {
-        match self.controller.focus() {
+    /// Only event-focused timelines fetch a page. Live timelines are already at
+    /// the end; thread and pinned timelines return an unsupported-pagination error.
+    async fn forwards(&self, num_events: u16) -> Result<bool, Error> {
+        let fully_paginated = match self.controller.focus() {
             TimelineFocusKind::Live { .. } => Ok(true),
 
             TimelineFocusKind::Event { event_cache, .. } => {
@@ -80,7 +205,27 @@ impl super::Timeline {
             TimelineFocusKind::Thread { .. } | TimelineFocusKind::PinnedEvents { .. } => {
                 Err(Error::PaginationError(NotSupported))
             }
-        }
+        }?;
+        Ok(fully_paginated)
+    }
+
+    /// Wait for the room task and, when present, the event or thread task to
+    /// finish the updates queued when they accept each request.
+    ///
+    /// Both tasks are awaited even if one stops. If both fail, return the room
+    /// task's error; item subscribers do not need to consume their own queued diffs.
+    async fn wait_for_cache_updates(&self) -> Result<(), Error> {
+        let (room, focus) = futures_util::future::join(
+            self.room_updates_barrier.wait(),
+            async {
+                if let Some(barrier) = &self.focus_updates_barrier {
+                    barrier.wait().await
+                } else {
+                    Ok(())
+                }
+            },
+        ).await;
+        room.and(focus)
     }
 
     /// Paginate backwards in live mode.
@@ -98,7 +243,6 @@ impl super::Timeline {
             match event_cache_pagination.run_backwards_once(batch_size).await {
                 Ok(outcome) => {
                     if outcome.reached_start {
-                        self.controller.insert_timeline_start_if_missing().await;
                         return Ok(true);
                     }
 
@@ -115,7 +259,6 @@ impl super::Timeline {
             }
         }
     }
-
     /// Subscribe to the back-pagination status of a live timeline.
     ///
     /// This will return `None` if the timeline is in the focused mode.

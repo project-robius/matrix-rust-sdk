@@ -14,7 +14,7 @@
 
 //! Long-lived tasks for the timeline.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use eyeball::Subscriber as EyeballSubscriber;
 use matrix_sdk::{
@@ -29,13 +29,114 @@ use matrix_sdk_base::RoomInfo;
 use ruma::OwnedEventId;
 #[cfg(feature = "unstable-msc4426")]
 use ruma::{OwnedUserId, UserId};
-use tokio::sync::broadcast::{Receiver, error::RecvError};
+use tokio::sync::{
+    broadcast::{Receiver, error::RecvError},
+    mpsc, oneshot,
+};
 use tracing::{error, instrument, trace, warn};
 
 use crate::timeline::{
-    TimelineController, TimelineFocus, controller::ActiveCallInfo, event_item::RemoteEventOrigin,
-    traits::RoomDataProvider,
+    Error, TimelineController, TimelineFocus, controller::ActiveCallInfo,
+    event_item::RemoteEventOrigin, traits::RoomDataProvider,
 };
+
+/// Ask one cache-processing task to finish applying its queued updates.
+///
+/// The task records its queue length when it accepts the request. Later sync
+/// updates do not extend the wait, and item subscribers do not need to be polled.
+#[derive(Clone, Debug)]
+pub(super) struct CacheUpdateBarrier(
+    /// Sends each caller's reply channel to the cache-processing task.
+    mpsc::UnboundedSender<oneshot::Sender<()>>
+);
+
+/// The cache task's side of a [`CacheUpdateBarrier`].
+///
+/// Each task has its own receiver and uses [`next_cache_update`] while processing
+/// updates. Callers keep the sender and use [`CacheUpdateBarrier::wait`].
+pub(super) struct CacheUpdateBarrierReceiver {
+    /// Completion requests which have not yet been given a queue length.
+    requests: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    /// Updates left to receive for each request, paired with its reply channel.
+    /// A zero count gets a reply only after the last update has been applied.
+    pending: VecDeque<(usize, oneshot::Sender<()>)>,
+}
+
+impl CacheUpdateBarrierReceiver {
+    /// Mark waiting requests as covered by a fresh cache snapshot.
+    ///
+    /// Call this only after applying the snapshot and installing the new receiver
+    /// paired with it. The old receiver's remaining updates must not be replayed.
+    fn recovered(&mut self) {
+        for (remaining, _) in &mut self.pending {
+            *remaining = 0;
+        }
+    }
+}
+
+impl CacheUpdateBarrier {
+    /// Create a sender for callers and a receiver owned by one cache task.
+    pub(super) fn new() -> (Self, CacheUpdateBarrierReceiver) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Self(sender), CacheUpdateBarrierReceiver { requests: receiver, pending: VecDeque::new() })
+    }
+
+    /// Wait until the cache task has applied the updates queued when it accepts
+    /// this request, including updates which produce no visible items.
+    ///
+    /// Dropping this future stops waiting but does not cancel the cache task.
+    /// Returns [`Error::TimelineUpdateTaskStopped`] if the task stops before it
+    /// replies to the request.
+    pub(super) async fn wait(&self) -> Result<(), Error> {
+        let (sender, receiver) = oneshot::channel();
+        self.0.send(sender).map_err(|_| Error::TimelineUpdateTaskStopped)?;
+        receiver.await.map_err(|_| Error::TimelineUpdateTaskStopped)?;
+        Ok(())
+    }
+}
+
+/// Receive the next cache update while servicing pagination completion requests.
+///
+/// Each accepted request counts the updates currently queued, so new traffic
+/// cannot keep extending it. Call this again only after applying the previous
+/// update: that next call replies to requests whose last update is finished.
+/// Broadcast errors are returned to the task so it can recover from lag or stop.
+/// After lag recovery, use [`CacheUpdateBarrierReceiver::recovered`] before
+/// receiving more updates.
+async fn next_cache_update<T: Clone>(
+    updates: &mut Receiver<T>,
+    barriers: &mut CacheUpdateBarrierReceiver,
+) -> Result<T, RecvError> {
+    loop {
+        while let Ok(acknowledgment) = barriers.requests.try_recv() {
+            barriers.pending.push_back((updates.len(), acknowledgment));
+        }
+        while barriers.pending.front().is_some_and(|(remaining, _)| *remaining == 0) {
+            let (_, acknowledgment) = barriers.pending.pop_front().unwrap();
+            let _ = acknowledgment.send(());
+        }
+        tokio::select! {
+            biased;
+            Some(acknowledgment) = barriers.requests.recv() => {
+                barriers.pending.push_back((updates.len(), acknowledgment));
+            }
+            update = updates.recv() => {
+                let consumed = match &update {
+                    Ok(_) => 1,
+                    Err(RecvError::Lagged(skipped)) => *skipped as usize,
+                    Err(RecvError::Closed) => {
+                        barriers.pending.clear();
+                        return update;
+                    }
+                };
+                for (remaining, _) in &mut barriers.pending {
+                    *remaining = remaining.saturating_sub(consumed);
+                }
+                return update;
+            }
+        }
+    }
+}
 
 /// Long-lived task, in the pinned events focus mode, that updates the timeline
 /// after any changes in the pinned events.
@@ -93,6 +194,9 @@ pub(in crate::timeline) async fn pinned_events_task(
 
 /// Long-lived task, in the event focus mode, that updates the timeline after
 /// any changes to the underlying timeline.
+///
+/// `barriers` replies to pagination requests only after the cache updates
+/// have been applied, or a fresh snapshot has replaced a lagged subscription.
 #[instrument(
     skip_all,
     fields(
@@ -107,11 +211,12 @@ pub(in crate::timeline) async fn event_focused_task(
     event_cache: EventFocusedCache,
     timeline_controller: TimelineController,
     mut event_focused_events_recv: Receiver<TimelineVectorDiffs>,
+    mut barriers: CacheUpdateBarrierReceiver,
 ) {
     loop {
         trace!("Waiting for an event.");
 
-        let update = match event_focused_events_recv.recv().await {
+        let update = match next_cache_update(&mut event_focused_events_recv, &mut barriers).await {
             Ok(up) => up,
             Err(RecvError::Closed) => break,
             Err(RecvError::Lagged(num_skipped)) => {
@@ -120,7 +225,7 @@ pub(in crate::timeline) async fn event_focused_task(
                 // The updates might have lagged, but the room event cache might
                 // have events, so retrieve them and add them back again to the
                 // timeline, after clearing it.
-                let Ok((initial_events, _)) = event_cache.subscribe().await else {
+                let Ok((initial_events, new_receiver)) = event_cache.subscribe().await else {
                     error!("Failed to subscribe to the event-focused cache");
                     break;
                 };
@@ -128,6 +233,9 @@ pub(in crate::timeline) async fn event_focused_task(
                 timeline_controller
                     .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
                     .await;
+
+                event_focused_events_recv = new_receiver;
+                barriers.recovered();
 
                 continue;
             }
@@ -145,17 +253,21 @@ pub(in crate::timeline) async fn event_focused_task(
 
 /// For a thread-focused timeline, a long-lived task that will listen to the
 /// underlying thread updates.
+///
+/// `barriers` belongs to this thread task, independently of the room task. It
+/// replies only after applying queued updates or finishing lag recovery.
 pub(in crate::timeline) async fn thread_updates_task(
     mut thread_event_cache_subscriber: Subscriber<ThreadEventCacheUpdate>,
     event_cache: ThreadEventCache,
     timeline_controller: TimelineController,
+    mut barriers: CacheUpdateBarrierReceiver,
 ) {
     trace!("Spawned the thread event subscriber task.");
 
     loop {
         trace!("Waiting for an event.");
 
-        let update = match thread_event_cache_subscriber.recv().await {
+        let update = match next_cache_update(&mut thread_event_cache_subscriber, &mut barriers).await {
             Ok(up) => up,
             Err(RecvError::Closed) => break,
             Err(RecvError::Lagged(num_skipped)) => {
@@ -164,7 +276,14 @@ pub(in crate::timeline) async fn thread_updates_task(
                 // The updates might have lagged, but the room event cache might
                 // have events, so retrieve them and add them back again to the
                 // timeline, after clearing it.
-                _ = timeline_controller.init_with_thread_root(&event_cache).await;
+                match timeline_controller.init_with_thread_root(&event_cache).await {
+                    Ok((_, subscriber)) => thread_event_cache_subscriber = subscriber,
+                    Err(err) => {
+                        error!(?err, "Failed to restore thread timeline after lagging behind cache updates");
+                        break;
+                    }
+                }
+                barriers.recovered();
 
                 continue;
             }
@@ -212,18 +331,22 @@ pub(in crate::timeline) async fn thread_updates_task(
 
 /// Long-lived task that forwards the [`RoomEventCacheUpdate`]s (remote echoes)
 /// to the timeline.
+///
+/// `barriers` replies after this task's queued updates have been handled.
+/// Lag recovery keeps the timeline's focus and installs a fresh cache receiver.
 pub(in crate::timeline) async fn room_event_cache_updates_task(
     room_event_cache: RoomEventCache,
     timeline_controller: TimelineController,
     mut room_event_cache_subscriber: Subscriber<RoomEventCacheUpdate>,
     timeline_focus: TimelineFocus,
+    mut barriers: CacheUpdateBarrierReceiver,
 ) {
     trace!("Spawned the event subscriber task.");
 
     loop {
         trace!("Waiting for an event.");
 
-        let update = match room_event_cache_subscriber.recv().await {
+        let update = match next_cache_update(&mut room_event_cache_subscriber, &mut barriers).await {
             Ok(up) => up,
             Err(RecvError::Closed) => break,
             Err(RecvError::Lagged(num_skipped)) => {
@@ -232,7 +355,7 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                 // The updates might have lagged, but the room event cache might
                 // have events, so retrieve them and add them back again to the
                 // timeline, after clearing it.
-                let initial_events = match room_event_cache.events().await {
+                let (initial_events, new_subscriber) = match room_event_cache.subscribe().await {
                     Ok(initial_events) => initial_events,
                     Err(err) => {
                         error!(
@@ -243,9 +366,23 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                     }
                 };
 
-                timeline_controller
-                    .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
-                    .await;
+                match timeline_focus {
+                    TimelineFocus::Live { .. } => {
+                        timeline_controller
+                            .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
+                            .await;
+                    }
+                    TimelineFocus::Event { .. } => {
+                        timeline_controller.handle_remote_aggregations(
+                            vec![eyeball_im::VectorDiff::Append { values: initial_events.into() }],
+                            RemoteEventOrigin::Cache,
+                        ).await;
+                    }
+                    TimelineFocus::Thread { .. } | TimelineFocus::PinnedEvents => {}
+                }
+
+                room_event_cache_subscriber = new_subscriber;
+                barriers.recovered();
 
                 continue;
             }

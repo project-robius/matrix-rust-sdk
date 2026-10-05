@@ -53,6 +53,10 @@ pub(in crate::timeline) struct TimelineStateTransaction<'a, P: RoomDataProvider>
     /// Number of items when the transaction has been created/has started.
     number_of_items_when_transaction_started: usize,
 
+    /// Whether a reset kept local echoes and [`Self::commit`] must still publish
+    /// a `Clear` followed by an `Append` of the final items.
+    reset_preserving_local_echoes: bool,
+
     /// A clone of the previous meta, that we're operating on during the
     /// transaction, and that will be committed to the previous meta location in
     /// [`Self::commit`].
@@ -81,6 +85,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
 
         Self {
             number_of_items_when_transaction_started: items.len(),
+            reset_preserving_local_echoes: false,
             items,
             previous_meta,
             meta,
@@ -1075,6 +1080,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         // `VectorDiff::Clear` should be much more efficient to process for
         // subscribers.
         if self.items.has_local() {
+            self.reset_preserving_local_echoes = true;
             // Remove all remote events and virtual items that aren't date
             // dividers.
             self.items.for_each(|entry| {
@@ -1122,7 +1128,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         self.meta.update_read_marker(&mut self.items);
     }
 
-    pub(super) fn commit(self) {
+    pub(super) fn commit(mut self) {
         // Update the `subscriber_skip_count` value.
         let previous_number_of_items = self.number_of_items_when_transaction_started;
         let next_number_of_items = self.items.len();
@@ -1140,6 +1146,9 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         // Replace the pointer to the previous meta with the new one.
         *self.previous_meta = self.meta;
 
+        if self.reset_preserving_local_echoes {
+            self.items.reset_items_to_current();
+        }
         self.items.commit();
     }
 

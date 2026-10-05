@@ -62,6 +62,7 @@ use tracing::{instrument, trace, warn};
 
 use self::{
     algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
+    tasks::CacheUpdateBarrier,
 };
 use crate::timeline::controller::{CryptoDropHandles, SendReceiptDecision};
 
@@ -136,6 +137,14 @@ pub struct Timeline {
     /// Cloneable, inner fields of the `Timeline`, shared with some background
     /// tasks.
     controller: TimelineController,
+
+    /// Waits for this timeline's room-cache task to apply its queued updates.
+    /// Each timeline uses its own task, so another timeline cannot complete this wait.
+    room_updates_barrier: CacheUpdateBarrier,
+
+    /// Extra delivery wait for the event or thread cache-processing task.
+    /// `None` for live and pinned timelines; pagination waits for both tasks when set.
+    focus_updates_barrier: Option<CacheUpdateBarrier>,
 
     /// References to long-running tasks held by the timeline.
     drop_handle: Arc<TimelineDropHandle>,

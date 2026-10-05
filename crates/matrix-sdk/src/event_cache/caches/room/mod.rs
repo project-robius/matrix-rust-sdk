@@ -442,7 +442,8 @@ impl RoomEventCacheInner {
         let (stored_prev_batch_token, timeline_event_diffs) =
             state.handle_sync(timeline, &read_receipts).await?;
 
-        drop(state);
+        // Keep the state lock through publication so a snapshot paired with
+        // a fresh subscription cannot include events whose diffs arrive later.
 
         // Now that all events have been added, we can trigger the
         // `pagination_token_notifier`.
@@ -473,6 +474,8 @@ impl RoomEventCacheInner {
                 None,
             );
         }
+
+        drop(state);
 
         Ok(())
     }

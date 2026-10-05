@@ -145,12 +145,15 @@ where
             }
         }
 
+        let operation_id = Arc::new(());
         let reset_status_on_drop_guard = ResetStatusOnDrop {
+            operation_id: operation_id.clone(),
             prev_status: Some(status_guard.clone()),
             pagination_status: status_observable.clone(),
         };
 
         let this = self.clone();
+        let future_operation_id = operation_id.clone();
 
         let fut: Pin<Box<dyn SharedPaginationFuture>> = Box::pin(async move {
             match this.paginate_backwards_impl(batch_size).await? {
@@ -160,9 +163,13 @@ where
                     reset_status_on_drop_guard.disarm();
 
                     // Notify subscribers that pagination ended.
-                    this.cache.status().set(SharedPaginationStatus::Idle {
-                        hit_timeline_start: outcome.reached_start,
-                    });
+                    if !finish_pagination_status(this.cache.status(), &future_operation_id, outcome.reached_start) {
+                        // A reset or newer operation superseded this page's
+                        // status. The events may still be valid (e.g. an initial
+                        // token arrived while waiting), but its endpoint is no
+                        // longer authoritative. A later call can confirm it.
+                        return Ok(Some(BackPaginationOutcome { reached_start: false, ..outcome }));
+                    }
 
                     Ok(Some(outcome))
                 }
@@ -185,6 +192,7 @@ where
             &mut status_guard,
             SharedPaginationStatus::Paginating {
                 shared_task: SharedPaginationTask {
+                    operation_id,
                     fut: shared_task.clone(),
                     _join_handle: Arc::new(AbortOnDrop::new(join_handle)),
                 },
@@ -320,6 +328,11 @@ impl<T: Future<Output = Result<Option<BackPaginationOutcome>>> + SendOutsideWasm
 /// shared future.
 #[derive(Clone)]
 pub(in super::super) struct SharedPaginationTask {
+    /// Shared identity of this cache pagination operation, compared by pointer.
+    /// Clones identify the same operation; a reset or newer operation prevents
+    /// this one from changing the current status.
+    operation_id: Arc<()>,
+
     /// The shared future for a pagination request running in the background, so
     /// that multiple callers can await it.
     fut: Shared<Pin<Box<dyn SharedPaginationFuture>>>,
@@ -390,9 +403,42 @@ pub enum PaginationStatus {
     Paginating,
 }
 
-/// Small RAII guard to reset the pagination status on drop, if not disarmed in
-/// the meanwhile.
+impl SharedPaginationStatus {
+    /// Whether this status still belongs to the operation identified by
+    /// `operation_id`. An idle status or another operation returns `false`.
+    fn is_operation(&self, operation_id: &Arc<()>) -> bool {
+        matches!(self, Self::Paginating { shared_task }
+            if Arc::ptr_eq(&shared_task.operation_id, operation_id))
+    }
+}
+
+/// Set the cache to idle only if `operation_id` still owns its running status.
+///
+/// Return `false` without changing status if a reset or newer operation replaced
+/// it. The caller then keeps the page's events but reports `reached_start: false`
+/// rather than confirming the start of history using an old operation.
+fn finish_pagination_status(
+    observable: &SharedObservable<SharedPaginationStatus>,
+    operation_id: &Arc<()>,
+    reached_start: bool,
+) -> bool {
+    let mut status = observable.write();
+    if !status.is_operation(operation_id) {
+        return false;
+    }
+    ObservableWriteGuard::set(&mut status, SharedPaginationStatus::Idle {
+        hit_timeline_start: reached_start,
+    });
+    true
+}
+
+/// Restore the previous pagination status on drop while this operation still
+/// owns it, unless [`Self::disarm`] was called after success.
+///
+/// A reset or newer operation makes the old guard harmless.
 struct ResetStatusOnDrop {
+    /// Operation allowed to restore the previous status if it is still running.
+    operation_id: Arc<()>,
     prev_status: Option<SharedPaginationStatus>,
     pagination_status: SharedObservable<SharedPaginationStatus>,
 }
@@ -406,8 +452,11 @@ impl ResetStatusOnDrop {
 
 impl Drop for ResetStatusOnDrop {
     fn drop(&mut self) {
-        if let Some(status) = self.prev_status.take() {
-            let _ = self.pagination_status.set(status);
+        if let Some(previous) = self.prev_status.take() {
+            let mut status = self.pagination_status.write();
+            if status.is_operation(&self.operation_id) {
+                ObservableWriteGuard::set(&mut status, previous);
+            }
         }
     }
 }

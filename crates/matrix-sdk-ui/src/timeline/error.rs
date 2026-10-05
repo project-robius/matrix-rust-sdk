@@ -68,6 +68,13 @@ pub enum Error {
     #[error(transparent)]
     PaginationError(#[from] PaginationError),
 
+    /// A cache-processing task stopped before replying that pagination updates
+    /// had been applied.
+    /// The network request may have succeeded, but some timeline changes may
+    /// still be missing from the returned items.
+    #[error("The timeline's pagination operation stopped before completion")]
+    TimelineUpdateTaskStopped,
+
     /// An error happened while operating the room's send queue.
     #[error(transparent)]
     SendQueueError(#[from] RoomSendQueueError),

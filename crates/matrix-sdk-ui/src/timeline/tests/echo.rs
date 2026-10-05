@@ -354,7 +354,13 @@ async fn test_no_reuse_of_counters() {
     // When clearing the timeline, the local echo remains.
     timeline.controller.clear().await;
 
-    assert_next_matches_with_timeout!(stream, VectorDiff::Remove { index: 1 });
+    // A real reset is observable even when local echoes survive it.
+    assert_next_matches_with_timeout!(stream, VectorDiff::Clear);
+    assert_next_matches_with_timeout!(stream, VectorDiff::Append { values } => {
+        assert_eq!(values.len(), 2);
+        assert!(values[0].is_date_divider());
+        assert_eq!(values[1].unique_id(), &local_id);
+    });
 
     // The next timeline item comes with a different unique id.
     timeline

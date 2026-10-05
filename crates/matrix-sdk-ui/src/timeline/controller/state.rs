@@ -45,6 +45,11 @@ pub(in crate::timeline) struct TimelineState<P: RoomDataProvider> {
     pub items: ObservableItems,
     pub meta: TimelineMetadata,
 
+    /// Counter updated whenever remote items are cleared or replaced, including
+    /// recovery from cache lag. Pagination compares its starting value with this
+    /// one to avoid confirming the start or end of history from before the reset.
+    pub pagination_generation: u64,
+
     /// The kind of focus of this timeline.
     pub(super) focus: Arc<TimelineFocusKind>,
 
@@ -66,6 +71,7 @@ impl<P: RoomDataProvider> TimelineState<P> {
     ) -> Self {
         Self {
             items: ObservableItems::new(),
+            pagination_generation: 0,
             meta: TimelineMetadata::new(
                 event_cache,
                 own_user_id,
@@ -92,6 +98,9 @@ impl<P: RoomDataProvider> TimelineState<P> {
             return;
         }
 
+        if diffs.iter().any(|diff| matches!(diff, VectorDiff::Clear | VectorDiff::Reset { .. })) {
+            self.pagination_generation = self.pagination_generation.wrapping_add(1);
+        }
         let mut transaction = self.transaction();
         transaction.handle_remote_events_with_diffs(diffs, origin, room_data, settings).await;
         transaction.commit();
@@ -221,6 +230,7 @@ impl<P: RoomDataProvider> TimelineState<P> {
     }
 
     pub(super) fn clear(&mut self) {
+        self.pagination_generation = self.pagination_generation.wrapping_add(1);
         let mut txn = self.transaction();
         txn.clear();
         txn.commit();
@@ -241,6 +251,7 @@ impl<P: RoomDataProvider> TimelineState<P> {
         Events: IntoIterator,
         Events::Item: Into<TimelineEvent>,
     {
+        self.pagination_generation = self.pagination_generation.wrapping_add(1);
         let mut txn = self.transaction();
         txn.clear();
         txn.handle_remote_events_with_diffs(

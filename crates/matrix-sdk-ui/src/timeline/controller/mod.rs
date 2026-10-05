@@ -83,7 +83,7 @@ use crate::{
         controller::decryption_retry_task::compute_redecryption_candidates,
         date_dividers::DateDividerAdjuster,
         event_item::TimelineItemHandle,
-        tasks::{event_focused_task, pinned_events_task, thread_updates_task},
+        tasks::{CacheUpdateBarrier, event_focused_task, pinned_events_task, thread_updates_task},
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -373,6 +373,9 @@ pub(super) struct InitFocusResult {
     /// If the timeline is a non-live timeline, an extra task that subscribes to
     /// changes to the focus source.
     pub focus_task: Option<BackgroundTaskHandle>,
+    /// Waits for the event or thread task to finish applying queued cache updates.
+    /// Live and pinned timelines have no separate pagination delivery wait.
+    pub focus_updates_barrier: Option<CacheUpdateBarrier>,
 }
 
 /// Holds the various info about the current call
@@ -505,7 +508,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
     /// method returns `Some(needs)` where `needs` is the number of events that
     /// must be unlazily backwards paginated.
     pub(super) async fn live_lazy_paginate_backwards(&self, num_events: u16) -> Option<usize> {
-        let state = self.state.read().await;
+        let state = self.state.write().await;
 
         let (count, needs) = state
             .meta
@@ -553,6 +556,46 @@ impl<P: RoomDataProvider> TimelineController<P> {
         let state = self.state.read().await;
 
         TimelineSubscriber::new(&state.items, &state.meta.subscriber_skip_count)
+    }
+
+    /// Read the reset counter before starting pagination so
+    /// [`Self::finish_pagination`] can avoid confirming old history after a reset.
+    pub(super) async fn pagination_generation(&self) -> u64 {
+        self.state.read().await.pagination_generation
+    }
+
+    /// Check the page result and optionally capture visible items and a new stream.
+    ///
+    /// Reaching the start or end becomes `Ok(false)` if `generation` changed since
+    /// pagination started. With `backwards`, a confirmed live start inserts
+    /// [`VirtualTimelineItem::TimelineStart`] before capturing the items.
+    ///
+    /// `subscribe` controls whether the tuple includes items and a subscription.
+    /// The check, marker, and subscription use the same state write lock, so a
+    /// reset cannot fall between them. Errors are preserved and still get a
+    /// subscription when requested.
+    pub(super) async fn finish_pagination(
+        &self,
+        result: Result<bool, Error>,
+        generation: u64,
+        backwards: bool,
+        subscribe: bool,
+    ) -> (Result<bool, Error>, Option<(Vector<Arc<TimelineItem>>, TimelineSubscriber)>) {
+        let mut state = self.state.write().await;
+        let result = result.map(|reached_end| reached_end && state.pagination_generation == generation);
+        if matches!(result, Ok(true)) && backwards
+            && matches!(self.focus(), TimelineFocusKind::Live { .. })
+        {
+            let mut txn = state.transaction();
+            txn.items.push_timeline_start_if_missing(
+                txn.meta.new_timeline_item(VirtualTimelineItem::TimelineStart),
+            );
+            txn.commit();
+        }
+        let subscription = subscribe.then(|| {
+            TimelineSubscriber::new(&state.items, &state.meta.subscriber_skip_count)
+        });
+        (result, subscription)
     }
 
     pub(super) async fn subscribe_filter_map<U, F>(
@@ -1542,7 +1585,11 @@ impl TimelineController {
                     PaginationStatus::Paginating => {}
                 }
 
-                Ok(InitFocusResult { has_events, focus_task: None })
+                Ok(InitFocusResult {
+                    has_events,
+                    focus_task: None,
+                    focus_updates_barrier: None,
+                })
             }
 
             TimelineFocusKind::Event {
@@ -1565,6 +1612,8 @@ impl TimelineController {
                 self.replace_with_initial_remote_events(events, RemoteEventOrigin::Pagination)
                     .await;
 
+                let (focus_updates_barrier, barrier_receiver) = CacheUpdateBarrier::new();
+
                 let task = self
                     .room_data_provider
                     .client()
@@ -1577,15 +1626,21 @@ impl TimelineController {
                             event_cache.clone(),
                             self.clone(),
                             receiver,
+                            barrier_receiver,
                         ),
                     )
                     .abort_on_drop();
 
-                Ok(InitFocusResult { has_events, focus_task: Some(task) })
+                Ok(InitFocusResult {
+                    has_events,
+                    focus_task: Some(task),
+                    focus_updates_barrier: Some(focus_updates_barrier),
+                })
             }
 
             TimelineFocusKind::Thread { event_cache, .. } => {
                 let (has_events, subscriber) = self.init_with_thread_root(event_cache).await?;
+                let (focus_updates_barrier, barrier_receiver) = CacheUpdateBarrier::new();
 
                 let room = &self.room_data_provider;
                 let span = info_span!(
@@ -1600,12 +1655,21 @@ impl TimelineController {
                     .task_monitor()
                     .spawn_infinite_task(
                         "timeline::thread_event_cache_updates",
-                        thread_updates_task(subscriber, event_cache.clone(), self.clone())
-                            .instrument(span),
+                        thread_updates_task(
+                            subscriber,
+                            event_cache.clone(),
+                            self.clone(),
+                            barrier_receiver,
+                        )
+                        .instrument(span),
                     )
                     .abort_on_drop();
 
-                Ok(InitFocusResult { has_events, focus_task: Some(task) })
+                Ok(InitFocusResult {
+                    has_events,
+                    focus_task: Some(task),
+                    focus_updates_barrier: Some(focus_updates_barrier),
+                })
             }
 
             TimelineFocusKind::PinnedEvents { event_cache } => {
@@ -1629,7 +1693,11 @@ impl TimelineController {
                     )
                     .abort_on_drop();
 
-                Ok(InitFocusResult { has_events, focus_task: Some(task) })
+                Ok(InitFocusResult {
+                    has_events,
+                    focus_task: Some(task),
+                    focus_updates_barrier: None,
+                })
             }
         }
     }

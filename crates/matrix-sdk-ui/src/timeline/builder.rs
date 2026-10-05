@@ -30,7 +30,8 @@ use crate::{
         TimelineReadReceiptTracking,
         controller::{ActiveCallInfo, InitFocusResult, spawn_crypto_tasks},
         tasks::{
-            room_event_cache_updates_task, room_send_queue_update_task, rtc_membership_update_task,
+            CacheUpdateBarrier, room_event_cache_updates_task, room_send_queue_update_task,
+            rtc_membership_update_task,
         },
         traits::RoomDataProvider,
     },
@@ -197,7 +198,10 @@ impl TimelineBuilder {
             controller.handle_active_call_update(initial_active_call_info.clone()).await;
         }
 
-        let InitFocusResult { focus_task, has_events } = controller.init_focus().await?;
+        let InitFocusResult { focus_task, focus_updates_barrier, has_events } =
+            controller.init_focus().await?;
+
+        let (room_updates_barrier, room_barrier_receiver) = CacheUpdateBarrier::new();
 
         let room_update_join_handle = room
             .client()
@@ -217,6 +221,7 @@ impl TimelineBuilder {
                     controller.clone(),
                     event_subscriber,
                     focus.clone(),
+                    room_barrier_receiver,
                 )
                 .instrument(span)
             })
@@ -288,6 +293,8 @@ impl TimelineBuilder {
 
         let timeline = Timeline {
             controller,
+            room_updates_barrier,
+            focus_updates_barrier,
             drop_handle: Arc::new(TimelineDropHandle {
                 _crypto_drop_handles: crypto_drop_handles,
                 _room_update_join_handle: room_update_join_handle,

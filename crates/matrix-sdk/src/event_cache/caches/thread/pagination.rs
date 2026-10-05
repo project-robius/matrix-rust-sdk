@@ -208,6 +208,18 @@ impl PaginatedCache for ThreadEventCacheWrapper {
 
                 trace!(?reached_start, "reloaded chunk from disk ({} items)", events.len());
 
+                // Publish under the cache state lock, atomically with snapshots
+                // and new subscriptions, including cache-only pagination.
+                if !timeline_event_diffs.is_empty() {
+                    self.cache.update_sender.send(
+                        ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                            diffs: timeline_event_diffs.clone(),
+                            origin: EventsOrigin::Cache,
+                        }),
+                        Some(RoomEventCacheGenericUpdate { room_id: self.cache.room_id.clone() }),
+                    );
+                }
+
                 LoadMoreEventsBackwardsOutcome::Events {
                     events,
                     timeline_event_diffs,
@@ -256,19 +268,9 @@ impl PaginatedCache for ThreadEventCacheWrapper {
     async fn conclude_backwards_pagination_from_disk(
         &self,
         events: Vec<Event>,
-        timeline_event_diffs: Vec<VectorDiff<Event>>,
+        _timeline_event_diffs: Vec<VectorDiff<Event>>,
         reached_start: bool,
     ) -> BackPaginationOutcome {
-        if !timeline_event_diffs.is_empty() {
-            self.cache.update_sender.send(
-                ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
-                    diffs: timeline_event_diffs,
-                    origin: EventsOrigin::Cache,
-                }),
-                Some(RoomEventCacheGenericUpdate { room_id: self.cache.room_id.clone() }),
-            );
-        }
-
         BackPaginationOutcome {
             reached_start,
             // This is a backwards pagination. `BackPaginationOutcome` expects
