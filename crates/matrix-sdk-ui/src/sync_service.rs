@@ -318,6 +318,19 @@ impl SyncTaskSupervisor {
                     error!("when awaiting encryption sync: {err:#}");
                 }
 
+                // An expired session isn't a connection problem, and both sessions have been reset
+                // by now, so restart right away instead of going offline or stopping.
+                if report.has_expired() {
+                    // Drop the stopped service's own report, but honor a `stop()` that raced with us.
+                    if std::iter::from_fn(|| receiver.try_recv().ok())
+                        .any(|queued| matches!(queued.origin, TerminationOrigin::Supervisor))
+                    {
+                        state.set(State::Idle);
+                        break;
+                    }
+                    continue;
+                }
+
                 if let Some(error) = report.error {
                     if offline_mode {
                         state.set(State::Offline);

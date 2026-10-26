@@ -299,6 +299,48 @@ async fn test_sync_service_offline_mode_stopping() {
 }
 
 #[async_test]
+async fn test_sync_service_offline_mode_restarts_an_expired_session() {
+    let mock_server = MatrixMockServer::new().await;
+    let client = mock_server.client_builder().build().await;
+
+    let sync_service = SyncService::builder(client).with_offline_mode().build().await.unwrap();
+    let mut states = sync_service.state();
+
+    // If the service went offline, failing `/versions` would keep it there.
+    mock_server.mock_versions().error500().mount().await;
+
+    // The server forgets our session on the first request, then syncs normally.
+    mock_server
+        .mock_sliding_sync()
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "errcode": "M_UNKNOWN_POS",
+            "error": "Unknown position",
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .with_priority(1)
+        .mount()
+        .await;
+    let encryption_pos = Arc::new(Mutex::new(0));
+    let room_pos = Arc::new(Mutex::new(0));
+    let _guard =
+        setup_mocking_sliding_sync_server(&mock_server, encryption_pos.clone(), room_pos.clone())
+            .await;
+
+    sync_service.start().await;
+    assert_next_matches!(states, State::Running);
+
+    // Both syncs restart and keep syncing without the service leaving the running state.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_pending!(states);
+    assert!(*encryption_pos.lock().unwrap() > 1);
+    assert!(*room_pos.lock().unwrap() > 1);
+
+    sync_service.stop().await;
+    assert_next_matches_with_timeout!(states, 2000, State::Idle);
+}
+
+#[async_test]
 async fn test_sync_service_offline_mode_restarting() {
     let mock_server = MatrixMockServer::new().await;
     let client = mock_server.client_builder().build().await;
