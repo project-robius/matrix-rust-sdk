@@ -38,16 +38,21 @@ pub async fn filter_duplicate_events(
     linked_chunk: &EventLinkedChunk,
     mut new_events: Vec<Event>,
 ) -> Result<DeduplicationOutcome, EventCacheError> {
-    // Remove all events with no ID, or that are duplicated among the new
-    // events, i.e. `new_events` contains duplicated events in itself (e.g.
-    // `[$e0, $e1, $e0]`, here `$e0` is duplicated).
+    // Remove all events with no ID, with no event type, or that are duplicated
+    // among the new events, i.e. `new_events` contains duplicated events in
+    // itself (e.g. `[$e0, $e1, $e0]`, here `$e0` is duplicated).
+    //
+    // Events with no ID or no event type are never persisted by the stores, so
+    // they must not reach the in-memory linked chunk either: otherwise the
+    // positions in memory and in the store would diverge.
     {
         let mut event_ids = BTreeSet::new();
 
         new_events.retain(|event| {
-            // Only keep events with IDs, and those for which `insert` returns
-            // `true` (meaning they were not in the set).
-            event.event_id().is_some_and(|event_id| event_ids.insert(event_id.to_owned()))
+            // Only keep events with IDs and event types, and those for which
+            // `insert` returns `true` (meaning they were not in the set).
+            event.kind.event_type().is_some()
+                && event.event_id().is_some_and(|event_id| event_ids.insert(event_id.to_owned()))
         });
     }
 
@@ -102,7 +107,7 @@ pub async fn filter_duplicate_events(
 pub(super) struct DeduplicationOutcome {
     /// All events passed to the deduplicator.
     ///
-    /// All events in this collection have a valid event ID.
+    /// All events in this collection have a valid event ID and event type.
     ///
     /// This collection does not contain duplicated events in itself.
     pub all_events: Vec<Event>,

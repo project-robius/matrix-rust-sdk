@@ -368,10 +368,15 @@ impl<'a> StateLockWriteGuard<'a, PinnedEventsCacheState> {
 
     async fn replace_all_events(
         &mut self,
-        new_events: Vec<Event>,
+        mut new_events: Vec<Event>,
         #[cfg_attr(not(feature = "e2e-encryption"), allow(unused_variables))] room: &Room,
     ) -> Result<()> {
         trace!("resetting all pinned events in linked chunk");
+
+        // Events with no ID or no event type are never persisted by the stores,
+        // so they must not reach the in-memory linked chunk either: otherwise
+        // the positions in memory and in the store would diverge.
+        new_events.retain(|event| event.event_id().is_some() && event.kind.event_type().is_some());
 
         let previous_pinned_event_ids = self.state.current_event_ids();
 
