@@ -54,9 +54,6 @@ pub enum ReplyError {
     /// The event to reply to could not be deserialized.
     #[error("failed to deserialize event to reply to")]
     Deserialization,
-    /// State events cannot be replied to.
-    #[error("tried to reply to a state event")]
-    StateEvent,
 }
 
 /// Whether or not to enforce a [`Relation::Thread`] when sending a reply.
@@ -111,9 +108,9 @@ async fn make_reply_event<S: EventSource>(
     let raw_event = event.into_raw();
     let event = raw_event.deserialize().map_err(|_| ReplyError::Deserialization)?;
 
+    // A state event can't have a relation, so a reply to one never continues a thread.
     let relation = as_variant!(&event, AnySyncTimelineEvent::MessageLike)
-        .ok_or(ReplyError::StateEvent)?
-        .original_content()
+        .and_then(|event| event.original_content())
         .and_then(|content| content.relation());
     let thread =
         relation.as_ref().and_then(|relation| as_variant!(relation, EncryptedRelation::Thread));
@@ -258,7 +255,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_cannot_reply_to_state_event() {
+    async fn test_reply_to_state_event() {
         let event_id = event_id!("$1");
         let own_user_id = user_id!("@me:saucisse.bzh");
 
@@ -271,20 +268,22 @@ mod tests {
 
         let content = RoomMessageEventContentWithoutRelation::text_plain("the reply");
 
-        assert_matches!(
-            make_reply_event(
-                cache,
-                own_user_id,
-                content,
-                Reply {
-                    event_id: event_id.into(),
-                    enforce_thread: EnforceThread::Unthreaded,
-                    add_mentions: AddMentions::Yes,
-                },
-            )
-            .await,
-            Err(ReplyError::StateEvent)
-        );
+        let reply_event = make_reply_event(
+            cache,
+            own_user_id,
+            content,
+            Reply {
+                event_id: event_id.into(),
+                enforce_thread: EnforceThread::MaybeThreaded,
+                add_mentions: AddMentions::Yes,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_let!(Some(Relation::Reply(reply)) = &reply_event.relates_to);
+
+        assert_eq!(reply.in_reply_to.event_id, event_id);
     }
 
     #[async_test]
