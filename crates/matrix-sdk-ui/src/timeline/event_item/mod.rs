@@ -864,6 +864,11 @@ pub struct ReactionInfo {
     /// Send state of the reaction when it's one of our own local echoes; `None`
     /// when it came from the server.
     pub send_state: Option<EventSendState>,
+    /// The name of a custom emoji reaction (whose key is an `mxc://` URI),
+    /// e.g. `:partyparrot:`, if its sender included one. See [MSC4027].
+    ///
+    /// [MSC4027]: https://github.com/matrix-org/matrix-spec-proposals/pull/4027
+    pub shortcode: Option<String>,
 }
 
 /// Reactions grouped by key first, then by sender.

@@ -1423,6 +1423,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 key: reaction_key.clone(),
                 sender: self.room_data_provider.own_user_id().to_owned(),
                 timestamp: MilliSecondsSinceUnixEpoch::now(),
+                shortcode: None,
             },
             Some(send_handle),
         );

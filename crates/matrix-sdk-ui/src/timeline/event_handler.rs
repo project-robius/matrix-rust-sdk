@@ -40,6 +40,7 @@ use ruma::{
     },
     serde::Raw,
 };
+use serde::Deserialize;
 use tracing::{debug, error, field::debug, instrument, trace, warn};
 
 use super::{
@@ -141,7 +142,7 @@ pub(super) struct TimelineEventContext {
 #[derive(Clone, Debug)]
 pub(super) enum HandleAggregationKind {
     /// Adding a reaction to the related event.
-    Reaction { key: String },
+    Reaction { key: String, shortcode: Option<String> },
 
     /// Redacting (removing) the related event.
     Redaction,
@@ -306,6 +307,16 @@ impl TimelineAction {
                     }
                 }
 
+                // The typed content drops a custom emoji reaction's shortcode, so we read it
+                // from the raw event.
+                Some(AnyMessageLikeEventContent::Reaction(c)) => vec![Self::HandleAggregation {
+                    related_event: c.relates_to.event_id,
+                    kind: HandleAggregationKind::Reaction {
+                        key: c.relates_to.key,
+                        shortcode: extract_reaction_shortcode(raw_event),
+                    },
+                }],
+
                 Some(content) => {
                     vec![Self::from_content(content, in_reply_to, thread_root, thread_summary)]
                 }
@@ -424,7 +435,10 @@ impl TimelineAction {
                 // This is a reaction to a message.
                 Self::HandleAggregation {
                     related_event: c.relates_to.event_id.clone(),
-                    kind: HandleAggregationKind::Reaction { key: c.relates_to.key },
+                    kind: HandleAggregationKind::Reaction {
+                        key: c.relates_to.key,
+                        shortcode: None,
+                    },
                 }
             }
 
@@ -684,8 +698,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         kind: HandleAggregationKind,
     ) {
         match kind {
-            HandleAggregationKind::Reaction { key } => {
-                self.handle_reaction(related_event, key);
+            HandleAggregationKind::Reaction { key, shortcode } => {
+                self.handle_reaction(related_event, key, shortcode);
             }
             HandleAggregationKind::Redaction => {
                 self.handle_redaction(related_event);
@@ -775,13 +789,19 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     /// Reactions to local events are applied in
     /// [`crate::timeline::TimelineController::handle_local_echo`].
     #[instrument(skip(self))]
-    fn handle_reaction(&mut self, relates_to: OwnedEventId, reaction_key: String) {
+    fn handle_reaction(
+        &mut self,
+        relates_to: OwnedEventId,
+        reaction_key: String,
+        shortcode: Option<String>,
+    ) {
         let target = TimelineEventItemId::EventId(relates_to);
 
         let aggregation = self.new_aggregation(AggregationKind::Reaction {
             key: reaction_key,
             sender: self.ctx.sender.clone(),
             timestamp: self.ctx.timestamp,
+            shortcode,
         });
 
         self.meta.aggregations.add(target.clone(), aggregation.clone());
@@ -1451,4 +1471,23 @@ fn transfer_details(new_item: &mut EventTimelineItem, old_item: &EventTimelineIt
     if matches!(&in_reply_to.event, TimelineDetails::Unavailable) {
         in_reply_to.event = old_in_reply_to.event.clone();
     }
+}
+
+/// Extract the shortcode of a custom emoji reaction from its raw event, if it
+/// has one.
+///
+/// [MSC4027] puts it in the reaction's content under `shortcode`, or under
+/// `com.beeper.reaction.shortcode` until that MSC is stable.
+///
+/// [MSC4027]: https://github.com/matrix-org/matrix-spec-proposals/pull/4027
+fn extract_reaction_shortcode(raw_event: &Raw<AnySyncTimelineEvent>) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ReactionShortcode {
+        shortcode: Option<String>,
+        #[serde(rename = "com.beeper.reaction.shortcode")]
+        unstable_shortcode: Option<String>,
+    }
+
+    let content = raw_event.get_field::<ReactionShortcode>("content").ok().flatten()?;
+    content.shortcode.or(content.unstable_shortcode)
 }

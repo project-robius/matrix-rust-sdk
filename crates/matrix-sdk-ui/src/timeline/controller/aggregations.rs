@@ -124,6 +124,8 @@ pub(crate) enum AggregationKind {
         sender: OwnedUserId,
         /// Timestamp at which the reaction has been sent.
         timestamp: MilliSecondsSinceUnixEpoch,
+        /// The name of a custom emoji reaction, if its sender included one.
+        shortcode: Option<String>,
     },
 
     /// An event has been redacted.
@@ -320,7 +322,7 @@ impl Aggregation {
                 Err(err) => ApplyAggregationResult::Error(err),
             },
 
-            AggregationKind::Reaction { key, sender, timestamp } => {
+            AggregationKind::Reaction { key, sender, timestamp, shortcode } => {
                 let previous_reaction =
                     event.reactions().get(key).and_then(|by_user| by_user.get(sender));
 
@@ -335,7 +337,11 @@ impl Aggregation {
                 } else {
                     event.to_mut().reactions_mut().entry(key.clone()).or_default().insert(
                         sender.clone(),
-                        ReactionInfo { timestamp: *timestamp, send_state: self.send_state.clone() },
+                        ReactionInfo {
+                            timestamp: *timestamp,
+                            send_state: self.send_state.clone(),
+                            shortcode: shortcode.clone(),
+                        },
                     );
 
                     ApplyAggregationResult::UpdatedItem
